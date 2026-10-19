@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kraken 3 — XPBD Referenzlöser (Milestone 1)</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:100%;height:100%;background:#000;overflow:hidden;
+    font-family:'Share Tech Mono',ui-monospace,Menlo,Consolas,monospace;color:#3affa8}
+  canvas{position:fixed;inset:0;display:block}
+  #hud{position:fixed;top:0;left:0;right:0;padding:10px 14px;background:rgba(0,6,4,.9);
+    border-bottom:1px solid #0f32;font-size:12px;letter-spacing:1px;z-index:10;
+    display:flex;gap:22px;flex-wrap:wrap;align-items:baseline}
+  #hud b{color:#00ffb3;font-weight:400}
+  .dim{color:#0f68}
+  #note{position:fixed;left:14px;bottom:12px;font-size:11px;color:#0f68;max-width:60ch;line-height:1.6;z-index:10}
+  a{color:#0f8}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <span><b>Kraken 3 GPU</b> <span class="dim">Milestone 1 — XPBD-Referenzlöser</span></span>
+  <span>Schritte <b id="steps">0</b></span>
+  <span>Sim-Zeit <b id="time">0.0</b> s</span>
+  <span>Kraken-Schritte/s <b id="sps">0</b></span>
+  <span>Tiere <b id="count">1</b></span>
+  <span>verankert <b id="anch">0</b>/6</span>
+  <span>max|v| <b id="mv">0</b> px/s</span>
+</div>
+<div id="note">
+  Kein Gehirn, kein Framework, keine Physik-Engine. Der Gang ist ein Platzhalter-Controller
+  (<span class="dim">src/render/demo.js</span>), die Bewegung entsteht ausschließlich aus
+  Gelenk-Compliance und Saugnapf-Adhäsion — es wirkt keine Kraft auf den Mantel.
+  <br>Abnahme: <a href="https://github.com/lamachen/Kraken_3_GPU/blob/main/tools/harness.js">tools/harness.js</a> · 22/22 Checks
+  <br><span class="dim">Tasten: [1…4] = 1/4/16/64 Tiere · Leertaste = Pause · R = neu würfeln</span>
+</div>
+<script type="module">
+import { createSim, stepSim, applyControl, readState } from './src/sim/core.js';
+import { createView } from './src/render/view.js';
+import { demoControl } from './src/render/demo.js';
+
+let count = 1, paused = false, seed = 7;
+let sim = createSim({ seed, creatures: count });
+const view = createView(document.getElementById('c'), sim);
+document.getElementById('count').textContent = count;
+
+function rebuild(n, s) {
+  count = n; if (s !== undefined) seed = s;
+  sim = createSim({ seed, creatures: count });
+  view2 = createView(document.getElementById('c'), sim);
+  document.getElementById('count').textContent = count;
+}
+let view2 = view;
+
+const el = (id) => document.getElementById(id);
+let last = performance.now(), acc = 0, frames = 0, sps = 0;
+
+function loop() {
+  requestAnimationFrame(loop);
+  const now = performance.now();
+  acc += now - last; last = now; frames++;
+  if (acc > 500) { sps = frames / (acc / 1000) * count; acc = 0; frames = 0; el('sps').textContent = Math.round(sps); }
+
+  if (!paused) {
+    const budget = performance.now();
+    let n = 0;
+    while (performance.now() - budget < 12 && n < 40) {
+      for (const c of sim.creatures) applyControl(c, demoControl(c, sim.stepCount));
+      stepSim(sim);
+      n++;
+    }
+  }
+  view2.draw();
+
+  el('steps').textContent = sim.stepCount;
+  el('time').textContent = sim.time.toFixed(1);
+  const w = sim.world;
+  el('mv').textContent = w.stats.maxSpeed.toFixed(0);
+  let anch = 0;
+  for (const arm of sim.creatures[0].arms) if (!arm.grip.broken) anch++;
+  el('anch').textContent = anch;
+}
+loop();
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') { e.preventDefault(); paused = !paused; }
+  if (e.code === 'KeyR') rebuild(count, (Math.random() * 1e6) | 0);
+  if (e.code === 'Digit1') rebuild(1);
+  if (e.code === 'Digit2') rebuild(4);
+  if (e.code === 'Digit3') rebuild(16);
+  if (e.code === 'Digit4') rebuild(64);
+});
+</script>
+</body>
+</html>

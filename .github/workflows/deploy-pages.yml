@@ -1,0 +1,49 @@
+name: Deploy to GitHub Pages
+
+# Buildless: ES-Module werden direkt ausgeliefert, es gibt keinen Build-Schritt.
+# Der Workflow prüft die Abnahme-Checks und lädt dann das Repo-Root hoch.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Abnahme-Checks (22)
+        run: node tools/harness.js
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Artefakt vorbereiten
+        run: |
+          mkdir -p site
+          cp -r index.html .nojekyll src site/
+          test -f site/index.html || (echo "::error::index.html fehlt" && exit 1)
+          test -f site/src/sim/core.js || (echo "::error::src/sim/core.js fehlt" && exit 1)
+          test -f site/.nojekyll || touch site/.nojekyll
+          echo "Site-Inhalt:"; find site -type f | sort
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: site }
+      - id: deployment
+        uses: actions/deploy-pages@v4

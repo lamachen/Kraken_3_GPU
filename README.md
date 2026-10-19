@@ -1,0 +1,186 @@
+# Kraken 3 — GPU
+
+Physikalisch simulierte, cephalopodenartige Kreaturen, deren Verhalten **evolviert**
+statt programmiert wird. Proof of Concept für die Frage: *was ist für Spiel-KI
+überhaupt lernbar und kontrollierbar?*
+
+Vorgänger [`Kraken_v2`](https://github.com/lamachen/Kraken_v2) bleibt als Archiv
+stehen und läuft weiter auf [Pages](https://lamachen.github.io/Kraken_v2/).
+
+---
+
+## Warum neu angefangen wurde
+
+Nicht wegen Unordnung, sondern wegen zweier gemessener Deckel, die sich in der
+alten Architektur nicht heben ließen:
+
+1. **Lernbudget.** 5307 Gewichte, 8 Individuen × 12 Generationen = 96 Evaluationen
+   pro Phase → **55 Gewichte pro Evaluation**. Das ist kein Tuning-Problem, das
+   System konnte strukturell nicht konvergieren. Gemessen: Anker-Rate 7 → 12 %
+   über 14 Generationen, also praktisch kein Fortschritt.
+2. **Durchsatz.** 101 Sim-Schritte/s, CPU-gebunden. Der Speed-Regler brachte
+   1.28×, nicht mehr. Ein Curriculum-Durchlauf: 57 Minuten.
+
+Worker-Parallelität hätte 6× gegeben (9:1 — immer noch zu wenig). GPU-Batching
+gibt 100–1000× und macht die Frage **beantwortbar**: belastbares „ja, es lernt"
+*oder* belastbares „nein, diese Formulierung funktioniert nicht". Beides ist ein
+Ergebnis; aktuell ist keines von beiden erreichbar.
+
+## Design-Grundlagen (aus v2 übernommen, dort gemessen)
+
+- **Kein Wasser.** Die Kreaturen bewegen sich auf einer Oberfläche. Keine
+  Hydrodynamik, kein Paddeln, kein Auftrieb.
+- **Keine Antriebskraft auf den Körper.** Gelenkmomente sind innere Kräfte
+  (Actio = Reactio innerhalb der Armkette) und ändern den Gesamtimpuls nicht.
+- **Der einzige Antrieb:** Spitze haftet am Untergrund → Muskeln knicken den Arm
+  ein → der Arm wird kürzer → der Mantel wird herangezogen. Hält die Spitze
+  stattdessen etwas Freies und Leichtes, zieht dieselbe Mechanik das Objekt heran.
+- **Haftung ist ein Reflex, kein Schalter.** Das Netz steuert eine stetige
+  Haftstärke `a ∈ [0,1]`, kein „an/aus". Angehaftet wird, wenn die Spitze
+  relativ zum Untergrund *steht* (Slip-Gate) — der Takt des Gangs ergibt sich
+  daraus physikalisch, ohne dass die KI einen Einschalt-Zeitpunkt treffen muss.
+- **Begrenzte Haltekraft.** Ein Saugnapf reißt, wenn die echte Kraft die
+  Adhäsionsgrenze übersteigt — geprüft über den Lagrange-Multiplikator, nicht
+  über eine Dehnungsschwelle. Kein Timer.
+- **Keine dedizierten Greifpunkte in der Karte.** Nur Rand und zufälliger
+  Korridorraster. Der Saugnapf haftet am Untergrund überall.
+- **Keine handgeschriebene Gangkurve.** Ein CPG mit geformter Sinuswelle war in
+  v2 eingebaut und hat messbar geschadet: Trend auf die Netto-Distanz
+  −9.34 px/Generation *mit* Kurve gegen +5.14 px/Generation *ohne*.
+- **Propriozeption ist der entscheidende Eingang.** In v2 brachte sie
+  +50.8 Score/Generation gegen +10.4 ohne. Ein Netz, das die Pose der eigenen
+  Arme nicht sieht, kann kein Körpermodell aufbauen.
+
+## Architektur
+
+```
+src/physics/xpbd.js    XPBD-Solver, flache typisierte Arrays. CPU-Referenz = ORAKEL.
+src/world/map.js       Rechteckkarte + analytisches Signed-Distance-Field.
+src/body/kraken.js     Körpermodell: Mantel + 6 Arme × 7 Segmente, 1 Saugnapf/Arm.
+src/sim/core.js        DOM-freier Simulationskern: Zustand, Propriozeption, Steuerung.
+src/render/            EINZIGE DOM-abhängige Schicht (view.js) + Platzhalter-Gang (demo.js).
+tools/harness.js       22 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
+```
+
+`src/physics`, `src/world`, `src/body` und `src/sim` enthalten **keine einzige
+DOM-Referenz** — Check 9 im Harness erzwingt das. Deshalb läuft derselbe Kern
+unverändert im Browser, im Worker und headless; der Worker-/GPU-Split ist kein
+Retrofit.
+
+**Buildless.** Kein Framework, kein Bundler, keine `node_modules`. `index.html`
+lädt ES-Module direkt. Deployment auf Pages ist ein Upload, kein Build.
+
+### Warum XPBD und keine Physik-Engine
+
+v2 benutzte matter-js. Vier voneinander unabhängige Engine-Eigenheiten haben dort
+jeweils Stunden gekostet; alle vier sind hier strukturell ausgeschlossen:
+
+| matter-js-Verhalten | gemessene Folge in v2 |
+|---|---|
+| `angularStiffness` default 0 → `bodyA.angle -= p` ohne `anglePrev` | Kette mit Kräften=0, Momenten=0, Verletzung=0.00000 explodierte auf `max|v|`=69 px/step, `max|ω|`=95 rad/step im ersten Update |
+| `chamfer radius > min(w,h)/2` | degenerierte 1.6-px-Splitter, `inertia` 1.20 statt 10.52, Trägheitsverhältnis 250:1 |
+| `constraint.pointA` rotiert nur inkrementell ab `angleA` | Schulteranker um 56.94 px versetzt, wenn die Pose nach `create()` gesetzt wurde |
+| `setVelocity` normalisiert auf `_baseDelta` | Einheitenfalle bei Substeps |
+
+XPBD projiziert Positionen und rechnet die Geschwindigkeiten **danach** aus der
+tatsächlichen Positionsänderung zurück (`v = (pPred − p)/h`). Projektion und
+Impuls können damit nicht auseinanderlaufen, und das Verfahren ist von Natur aus
+dissipativ. Check 1 (passives Gleichgewicht) ist die direkte Konsequenz:
+
+```
+Passiv, 8 s, kein Antrieb, keine Haftung:
+  Pfad          0.00e+0 px      (v2: 964 px)
+  Verschiebung  0.00e+0 px
+  max|ω|        4.26e-13 rad/s  (Float-Rauschen)
+```
+
+### Muskel als Compliance, nicht als Drehmoment
+
+Ein Muskel ist die **Compliance eines Winkel-Constraints** — also Steifigkeit,
+direkt von der KI gesteuert. Schlaffer Arm = hohe Compliance = gibt nach.
+Gespannter Arm = niedrige Compliance = hält Form und überträgt Zug. Das ist das
+Muskel-Hydrostat-Prinzip in seiner natürlichen Formulierung; in v2 musste es über
+einen skalierten Drehmoment-Term nachgebildet werden.
+
+Kalibrierung: XPBD löst mit `α̃ = α/h²`, und `α̃` muss in der Größenordnung der
+effektiven Winkelmasse `wSum ≈ 0.33` liegen. Mit `h = 1/120` ist `α̃ = 14400/k`,
+also `k ≈ 43.600` für `α̃ = wSum`. Der erste Entwurf hatte `k ∈ [8, 400]` —
+Muskeln waren damit praktisch inert (Gelenkkorrektur 1e-7 rad pro Iteration).
+
+### Saugnapf-Bruch über echte Kraft
+
+`λ` ist der akkumulierte Lagrange-Multiplikator, `F = |λ|/h`. Der Bruch wird
+daran geprüft, nicht an einer Dehnung. Check 4:
+
+```
+schwach gestellt (83 N Grenze)  → reißt bei 272 N Spitze
+voll gestellt   (900 N Grenze)  → hält unter demselben Zug
+```
+
+## Abnahme: `node tools/harness.js`
+
+```
+22/22 Checks bestanden
+  passiv        exakt in Ruhe            Pfad 0.00e+0 px        (v2: 964 px)
+  spawn         Pin-Verletzung 0         max 0.000e+0 px        (v2: 56.94 px)
+  spawn-motor   Muskelziele = Spawn-Pose
+  grip          verankerter Arm zieht    70.6 px = 72 %         (v2: 92…99 %)
+  break         schwacher Grip reißt     272 N > 83 N Grenze
+  break-hold    starker Grip hält        900 N Grenze
+  long-nan      0 NaN / 1200 Schritte
+  long-oob      0 außerhalb der Karte                           (v2: 129)
+  long-v        peak|v| im Limit         360 px/s               (v2: 4188 px/s)
+  long-av       peak|ω| im Limit         18 rad/s               (v2: 3918 rad/step)
+  mass          Rumpf : Segment          11.1:1                 (v2: 250:1)
+  mass-taper    Taper über den Arm       1.78:1
+  determinism   gleicher Seed → identisch, bit-genau
+  proprio       42 Eingänge, 29 belegt, 0 NaN, alle normiert     (v2: 0 Gelenkwinkel)
+  domfree       Kern ohne DOM-Referenz
+  perf-single   4161 Kraken-Schritte/s                          (v2: 101)  = 41×
+  perf-linear   88 % Effizienz bei 64× Batch
+  map-spawn     20/20 Karten mit voller Armfreiheit
+  map-nogrip    keine dedizierten Greifpunkte
+```
+
+### Performance
+
+| Tiere | Sim-Schritte/s | Kraken-Schritte/s | ms/Schritt |
+|---|---|---|---|
+| 1 | 4161 | 4161 | 0.24 |
+| 8 | 503 | 4027 | 1.99 |
+| 64 | 57 | 3652 | 17.5 |
+
+Lineare Skalierung, 88 % Effizienz bei 64× Batch. **Das ist die Voraussetzung für
+GPU-Batching:** die Kosten pro Tier dürfen mit der Batch-Größe nicht wachsen.
+Der erste Entwurf war hier O(n²) — `w.step()` lief pro Krake statt pro
+Sim-Schritt, 64 Tiere kosteten 1083 ms statt 18 ms. Check `perf-linear` fängt
+das ab, weil es die gesamte GPU-These zerstört hätte.
+
+Superlinearen Gewinn gibt es erst aus der räumlichen Parallelität des Shaders,
+nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
+
+## Milestones
+
+1. **[fertig] Kern + Physik.** XPBD-Referenzlöser, Körpermodell, Karte,
+   Propriozeption, 22 Abnahme-Checks, Viewer.
+2. **Sinne.** Echolot per SDF-Raymarching (trainings-tauglich: kein Wellenfeld
+   pro Tier), Chemorezeption, Photorezeption. Im Spiel bleibt das Wellenfeld mit
+   gegenseitigem Hören — dieselbe Sensor-Schnittstelle, zwei Implementierungen.
+3. **Gehirn + Evolution + GPU.** WGSL-Portierung des Solvers gegen das Oracle
+   getestet, NN als batched Matmul, Natural Evolution Strategies (nicht CMA-ES:
+   bei 5307 Dimensionen wäre die Kovarianzmatrix 112 MB plus Eigenzerlegung).
+4. **Gegner.** Bewohner-Agent im Trainings-Loop mit Lärm, Duftspur und Angriff.
+   In v2 war die komplette gegenseitige Wahrnehmung gebaut, stand aber unter
+   keinem Selektionsdruck: `stepPhysics` hatte null Referenzen auf den Spieler.
+
+## Lokal
+
+```bash
+node tools/harness.js          # 22 Abnahme-Checks
+python3 -m http.server 8080    # oder: npx serve .   → http://localhost:8080
+```
+
+ES-Module brauchen einen Server (CORS bei `file://`). Kein Build, keine
+Abhängigkeiten.
+
+Tasten: `1…4` = 1/4/16/64 Tiere · `Leertaste` = Pause · `R` = Karte neu würfeln.
