@@ -18,7 +18,12 @@ import {
   spawnKraken, tipPosition, attachGrip, releaseGrip, armCurl, armExtension,
   toneToCompliance, adhesionToBreakForce, BODY, ARM_REACH,
 } from '../src/body/kraken.js';
-import { createSim, stepSim, readState, readProprio, applyControl, PROPRIO_DIM } from '../src/sim/core.js';
+import { createSim, stepSim, readState, readProprio, readSenses, applyControl, tickSenses, PROPRIO_DIM, SENSE_DIM, INPUT_DIM } from '../src/sim/core.js';
+import { createEcho, emit as echoEmit, tick as echoTick, raymarch, ECHO_RAYS, SOUND_SPEED } from '../src/senses/echo.js';
+import { createChem, sample as chemSample, gradientDirection } from '../src/senses/chem.js';
+import { createLight, sample as lightSample } from '../src/senses/light.js';
+import { createHear, sample as hearSample, bearing as hearBearing } from '../src/senses/hear.js';
+import { makeEntity, tickEntity, KIND_PREY } from '../src/world/entities.js';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -289,7 +294,7 @@ if (want('proprio')) {
 // ══════════════════════════════════════════════════════════════
 section('CHECK 9 — KERN IST DOM-FREI (Voraussetzung für Worker + GPU)');
 if (want('domfree')) {
-  const dirs = ['src/physics', 'src/world', 'src/body', 'src/sim'];
+  const dirs = ['src/physics', 'src/world', 'src/body', 'src/sim', 'src/senses'];
   const hits = [];
   for (const d of dirs) {
     const abs = join(ROOT, d);
@@ -340,6 +345,150 @@ if (want('perf')) {
   check('perf-linear', 'Kosten pro Tier wachsen nicht mit dem Batch (≥ 50 % Effizienz bei 64×)',
     cps64 >= cps1 * 0.5,
     `${cps64.toFixed(0)} vs ${cps1.toFixed(0)} Kraken-Schritte/s = ${(cps64 / cps1 * 100).toFixed(0)} % Effizienz bei 64× Batch`);
+}
+
+section('CHECK S1 — ECHOLOT: Distanz, Laufzeit, Cooldown');
+if (want('echo')) {
+  const map = makeMap(1440, 810, { seed: 7 });
+  // (a) Distanzgenauigkeit gegen die echte SDF-Distanz
+  const wall = map.rects[0];                       // obere Randwand
+  const y = wall.y + wall.h + 60;
+  const trueD = 60;
+  const measured = raymarch(map.sdf, 720, y, -Math.PI / 2, 340);
+  check('echo-dist', 'Echolot-Distanz stimmt mit der Geometrie überein', Math.abs(measured - trueD) < 3,
+    `gemessen ${measured.toFixed(1)} px, tatsächlich ${trueD} px (Fehler ${(measured - trueD).toFixed(2)} px)`);
+
+  // (b) Laufzeit: das Echo darf NICHT im selben Schritt da sein
+  const e = createEcho();
+  echoEmit(e, map, 720, y, -Math.PI / 2, 0);
+  echoTick(e, 1 / 60, 1 / 60);
+  const early = e.range_.filter(v => v > 0).length;
+  const eta = e.pending.length ? e.pending[0].at : 0;
+  const expectEta = (2 * measured) / SOUND_SPEED;
+  let t = 0, arrived = 0;
+  while (t < 0.5 && e.pending.length) { t += 1 / 60; echoTick(e, 1 / 60, t); }
+  arrived = e.range_.filter(v => v > 0).length;
+  check('echo-latency', 'Echo kommt verzögert an (2·d/c), nicht sofort', early === 0 && arrived > 0,
+    `nach 1 Frame: ${early} Strahlen; ETA ${eta.toFixed(4)} s, erwartet ${expectEta.toFixed(4)} s; nach ${t.toFixed(2)} s: ${arrived}/${ECHO_RAYS}`);
+
+  // (c) Cooldown: eine SOFORTIGE Neu-Aussendung muss blockiert sein.
+  // (Der erste Entwurf maß das nach Ablauf der Wartezeit — dann ist der
+  //  Cooldown korrekt frei und der Test war sinnlos.)
+  const ec = createEcho();
+  echoEmit(ec, map, 720, y, -Math.PI / 2, 0);
+  const n1 = ec.emitCount;
+  echoEmit(ec, map, 720, y, -Math.PI / 2, 0.01);          // 10 ms später
+  const n2 = ec.emitCount;
+  for (let tt = 1 / 60; tt <= 0.5; tt += 1 / 60) echoTick(ec, 1 / 60, tt);   // Refraktärzeit abwarten
+  echoEmit(ec, map, 720, y, -Math.PI / 2, 0.5);
+  const n3 = ec.emitCount;
+  check('echo-cooldown', 'Aussendung hat Refraktärzeit, die danach wieder frei ist',
+    n2 === n1 && n3 === n1 + 1,
+    `sofort: ${n1}→${n2} (blockiert), nach ${ec.interval} s: →${n3} (frei)`);
+
+  // (d) Wer ortet, verrät sich — Loudness ist Teil der Schnittstelle
+  const e2 = createEcho();
+  const loud = echoEmit(e2, map, 720, y, -Math.PI / 2, 0);
+  check('echo-loud', 'Aussendung ist hörbar (loudness > 0)', loud > 0,
+    `loudness ${loud.toFixed(2)} — im Spiel hört das jeder passive Hörer`);
+}
+
+section('CHECK S2 — PASSIVES GEHÖR: Richtungsauflösung');
+if (want('hear')) {
+  const prey = makeEntity(KIND_PREY, 0, 0, {});
+  prey.noise = 0.9;
+  let maxErr = 0, n = 0;
+  for (const [dx, dy] of [[60, 0], [0, -60], [-60, 0], [0, 60], [42, 42], [-42, 42]]) {
+    const h = createHear();
+    hearSample(h, [prey], 700, 400);
+    prey.x = 700 + dx; prey.y = 400 + dy;
+    hearSample(h, [prey], 700, 400);
+    const b = hearBearing(h, 0);
+    if (!b) continue;
+    const want = Math.atan2(dy, dx);
+    let err = b.angle - want;
+    while (err > Math.PI) err -= Math.PI * 2;
+    while (err < -Math.PI) err += Math.PI * 2;
+    maxErr = Math.max(maxErr, Math.abs(err) * 180 / Math.PI); n++;
+  }
+  check('hear-bearing', 'Peilung zeigt zur Quelle (≤ 50° Fehler bei 4 Quadranten)', maxErr <= 50,
+    `${n} Richtungen getestet, größter Fehler ${maxErr.toFixed(0)}°`);
+
+  // Abfall mit der Distanz
+  const near = createHear(), far = createHear();
+  prey.x = 760; prey.y = 400; hearSample(near, [prey], 700, 400);
+  prey.x = 840; hearSample(far, [prey], 700, 400);
+  check('hear-falloff', 'Intensität fällt mit der Distanz', near.peak > far.peak * 1.3,
+    `60px → ${near.peak.toFixed(3)}, 140px → ${far.peak.toFixed(3)}`);
+}
+
+section('CHECK S3 — CHEMOREZEPTION: Gradient zeigt zur Quelle');
+if (want('chem')) {
+  const prey = makeEntity(KIND_PREY, 780, 400, { scent: 1.0 });
+  let ok = 0, n = 0;
+  for (const hdg of [0, Math.PI / 2, Math.PI, -Math.PI / 2]) {
+    const c = createChem();
+    for (let i = 0; i < 80; i++) chemSample(c, [prey], 700, 400, hdg);
+    const g = gradientDirection(c);
+    if (!g) continue;
+    n++;
+    // Der Gradient ist relativ zur Blickrichtung; die Quelle liegt bei Weltwinkel 0
+    let err = (hdg + g.angle) - 0;
+    while (err > Math.PI) err -= Math.PI * 2;
+    while (err < -Math.PI) err += Math.PI * 2;
+    if (Math.abs(err) < 0.9) ok++;
+  }
+  check('chem-gradient', 'Duftgradient zeigt zur Quelle (±0.9 rad bei 6 Sensoren)', ok >= 3,
+    `${ok}/${n} Blickrichtungen korrekt aufgelöst`);
+  const far = createChem();
+  const farPrey = makeEntity(KIND_PREY, 1300, 700, { scent: 1.0 });
+  chemSample(far, [farPrey], 700, 400, 0);
+  check('chem-range', 'Außerhalb der Reichweite → kein Signal', far.peak < 0.01,
+    `peak ${far.peak.toFixed(4)} bei ~700 px Abstand`);
+}
+
+section('CHECK S4 — PHOTOREZEPTION fällt mit dem Abstand ab');
+if (want('light')) {
+  const map = makeMap(1440, 810, { seed: 7 });
+  map.lights = [{ x: 400, y: 300, r: 260, ir: 0.8, c: [255, 255, 255], ph: 0, sp: 0.1 }];
+  const a = createLight(); lightSample(a, map, 400, 300, 0);
+  const b = createLight(); lightSample(b, map, 620, 300, 0);
+  const c = createLight(); lightSample(c, map, 1300, 700, 0);
+  check('light-falloff', 'Licht fällt mit dem Abstand ab', a.total > b.total && b.total > c.total,
+    `Quelle ${a.total.toFixed(3)} > 220px ${b.total.toFixed(3)} > fern ${c.total.toFixed(3)} (Ambient ${c.total.toFixed(3)})`);
+  check('light-ambient', 'Im Dunkeln bleibt nur Ambient', Math.abs(c.total - 0.05) < 1e-9,
+    `${c.total.toFixed(3)} — Sehen ist damit konstruktionsbedingt intermittierend`);
+}
+
+section('CHECK S5 — GESAMTER EINGANGSVEKTOR: Dimension, Endlichkeit, Normierung');
+if (want('input')) {
+  const sim = createSim({ seed: 23, creatures: 1, prey: 2, lights: 4 });
+  const c = sim.creatures[0];
+  const inp = new Float64Array(INPUT_DIM);
+  let nf = 0, oor = 0, peak = 0;
+  for (let i = 0; i < 400; i++) {
+    applyControl(c, {
+      tone: 0.5 + 0.5 * Math.sin(i * 0.05),
+      emitEcho: i % 20 === 0,
+      arms: c.arms.map((_, j) => ({ shoulder: Math.sin(i * 0.13 + j) * 2.5, curl: Math.sin(i * 0.29 + j) * 2.5, adhesion: 0.5 + 0.5 * Math.sin(i * 0.07 + j) })),
+    });
+    stepSim(sim);
+    readProprio(c, inp); readSenses(c, inp, sim.entities);
+    for (let k = 0; k < inp.length; k++) {
+      if (!Number.isFinite(inp[k])) nf++;
+      if (Math.abs(inp[k]) > peak) peak = Math.abs(inp[k]);
+      if (Math.abs(inp[k]) > 1.5) oor++;
+    }
+  }
+  check('input-dim', `Eingangsdimension = Proprio ${PROPRIO_DIM} + Sinne ${SENSE_DIM}`, INPUT_DIM === PROPRIO_DIM + SENSE_DIM,
+    `INPUT_DIM = ${INPUT_DIM}`);
+  check('input-finite', 'Kein NaN/Inf im Eingangsvektor', nf === 0, `${nf} ungültige Werte über 400 Schritte`);
+  check('input-range', 'Alle Werte normiert (|x| ≤ 1.5)', oor === 0, `Peak |x| = ${peak.toFixed(3)}, ${oor} außerhalb`);
+  const senseOff = PROPRIO_DIM;
+  let senseActive = 0;
+  for (let k = senseOff; k < INPUT_DIM; k++) if (Math.abs(inp[k]) > 1e-9) senseActive++;
+  check('input-senses', 'Sinnes-Eingänge sind belegt', senseActive >= 8,
+    `${senseActive}/${SENSE_DIM} Sinne liefern Werte (Echolot/Chem/Licht/Gehör/Tast)`);
 }
 
 section('CHECK 11 — KARTEN-ABDECKUNG / SPAWN');

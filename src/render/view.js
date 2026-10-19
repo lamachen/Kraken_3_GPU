@@ -37,12 +37,70 @@ export function createView(canvas, sim) {
     ctx.strokeStyle = '#123a26'; ctx.lineWidth = 1 / scale;
     for (const r of sim.map.rects) ctx.strokeRect(r.x, r.y, r.w, r.h);
 
+    // Lichtquellen (Sehen ist intermittierend — die Quellen wandern)
+    ctx.globalCompositeOperation = 'screen';
+    for (const l of sim.map.lights || []) {
+      const g = ctx.createRadialGradient(l.x, l.y, 0, l.x, l.y, l.r * 0.35);
+      g.addColorStop(0, `rgba(${l.c[0]},${l.c[1]},${l.c[2]},0.16)`);
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(l.x, l.y, l.r * 0.35, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+
+    // Entitäten (Beute): Körper + Duft-Aureole
+    for (const e of sim.entities || []) {
+      if (!e.alive) continue;
+      ctx.strokeStyle = 'rgba(255,105,25,0.18)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(e.x, e.y, 26, 0, Math.PI * 2); ctx.stroke();
+      if (e.noise > 0.02) {   // hörbar → Ring, Radius ~ Lautstärke
+        ctx.strokeStyle = `rgba(120,180,255,${(0.12 + e.noise * 0.35).toFixed(3)})`;
+        ctx.beginPath(); ctx.arc(e.x, e.y, e.radius + 4 + e.noise * 22, 0, Math.PI * 2); ctx.stroke();
+      }
+      const rg = ctx.createRadialGradient(e.x - 3, e.y - 3, 1, e.x, e.y, e.radius);
+      rg.addColorStop(0, '#ffcc44'); rg.addColorStop(0.5, '#ff6600'); rg.addColorStop(1, '#2a0800');
+      ctx.fillStyle = rg;
+      ctx.beginPath(); ctx.arc(e.x, e.y, e.radius, 0, Math.PI * 2); ctx.fill();
+    }
+
     // Kraken
     for (const c of sim.creatures) {
+      drawEcho(ctx, c);
       drawCreature(ctx, w, c);
     }
     ctx.setTransform(1, 0, 0, 1, 0, 0);
   }
+
+  /**
+   * Echolot visualisieren: die Strahlen, deren Echo bereits EINGETROFFEN ist.
+   * Bewusst nicht die ausgesendeten Strahlen — das Tier sieht die Vergangenheit,
+   * gestaffelt nach Entfernung. Genau das ist die Einschränkung, die das Netz
+   * lernen muss zu kompensieren.
+   */
+  function drawEcho(ctx, c) {
+    const e = c.echo;
+    const h = c.heading !== undefined ? c.heading : (w_ang(c) - Math.PI / 2);
+    for (let i = 0; i < e.rays; i++) {
+      if (e.range_[i] <= 0) continue;
+      const t = e.rays > 1 ? i / (e.rays - 1) : 0.5;
+      const a = h + (t - 0.5) * e.fan;
+      const d = e.range_[i] * e.range;
+      const x = sim.creatures[0] === c ? c.x : c.x, y = c.y;
+      const ex = x + Math.cos(a) * d, ey = y + Math.sin(a) * d;
+      const alpha = 0.12 + e.intensity[i] * 0.5;
+      ctx.strokeStyle = `rgba(192,80,255,${alpha.toFixed(3)})`;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(ex, ey); ctx.stroke();
+      ctx.fillStyle = `rgba(220,140,255,${Math.min(0.95, alpha + 0.25).toFixed(3)})`;
+      ctx.beginPath(); ctx.arc(ex, ey, 1.6 + e.intensity[i] * 2.4, 0, Math.PI * 2); ctx.fill();
+    }
+    // Aussendungs-Blitz
+    if (c.lastEchoEmit !== undefined && sim.time - c.lastEchoEmit < 0.07) {
+      ctx.strokeStyle = 'rgba(220,160,255,0.75)'; ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.arc(c.x, c.y, 20 + (sim.time - c.lastEchoEmit) * 900, 0, Math.PI * 2); ctx.stroke();
+    }
+  }
+  function w_ang(c) { return sim.world.ang[c.mantle]; }
 
   function drawCreature(ctx, w, c) {
     const col = c.index === 0 ? '#00ffb3' : `hsl(${(c.index * 67) % 360},90%,60%)`;

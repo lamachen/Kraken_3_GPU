@@ -7,8 +7,13 @@
  * läuft, und der Worker braucht exakt dieselben Module.
  */
 import { XpbdWorld } from '../physics/xpbd.js';
-import { makeMap, findSpawn, mulberry32 } from '../world/map.js';
+import { makeMap, findSpawn, mulberry32, tickMapLights } from '../world/map.js';
 import { spawnKraken, tipPosition, attachGrip, releaseGrip, armCurl, armExtension, toneToCompliance, adhesionToBreakForce, BODY, ARM_REACH } from '../body/kraken.js';
+import { makeEntity, tickEntity, KIND_PREY } from '../world/entities.js';
+import { createEcho, emit as emitEcho, tick as tickEcho, write as writeEcho, ECHO_DIM } from '../senses/echo.js';
+import { createChem, sample as sampleChem, write as writeChem, CHEM_DIM } from '../senses/chem.js';
+import { createLight, sample as sampleLight, write as writeLight, LIGHT_DIM } from '../senses/light.js';
+import { createHear, sample as sampleHear, write as writeHear, HEAR_DIM, bearing as hearBearing } from '../senses/hear.js';
 
 export const DEFAULTS = {
   width: 1440, height: 810,
@@ -23,6 +28,9 @@ export const DEFAULTS = {
   // gesetzter haftet. Kein Einschalt-Zeitpunkt, den die KI treffen müsste.
   gripSlipMax: 150,      // px/s
   gripCooldown: 0.05,    // s
+  prey: 0,               // Anzahl Beute-Entitäten (Duft- und Geräuschquellen)
+  preySpeed: 55,
+  lights: 4,
 };
 
 export function createSim(opts = {}) {
@@ -40,7 +48,14 @@ export function createSim(opts = {}) {
     const k = spawnKraken(world, sp.x, sp.y, rnd() * Math.PI * 2);
     creatures.push(makeCreature(world, k, map, o, i));
   }
-  return { world, map, creatures, opts: o, rnd, time: 0, stepCount: 0 };
+  // Beute-Entitäten: Duft- und Geräuschquellen. Milestone 4 ergänzt/augmentiert
+  // das um einen Bewohner-Agenten mit Policy — dieselbe Struktur.
+  const entities = [];
+  for (let i = 0; i < o.prey; i++) {
+    const sp = findSpawn(map, 40, rnd);
+    entities.push(makeEntity(KIND_PREY, sp.x, sp.y, { scent: 1.0, speed: o.preySpeed }));
+  }
+  return { world, map, creatures, entities, opts: o, rnd, time: 0, stepCount: 0 };
 }
 
 function makeCreature(world, k, map, opts, index) {
@@ -50,6 +65,10 @@ function makeCreature(world, k, map, opts, index) {
     // Steuerung (wird vom Gehirn beschrieben)
     tone: 0.5,                       // globaler Muskeltonus 0..1
     perArm: k.arms.map(() => ({ shoulder: 0, curl: 0, adhesion: 0, cd: 0 })),
+    // ── Sinne. Alle DOM-frei, alle mit derselben write(out, offset)-Schnittstelle. ──
+    echo: createEcho(), chem: createChem(), light: createLight(), hear: createHear(),
+    contact: new Float64Array(k.arms.length),
+    echoWantsEmit: false, echoLoudness: 0, lastEchoEmit: -1, hearBearing: null, heading: 0,
     // Propriozeption / Messwerte
     prevVx: 0, prevVy: 0, ax: 0, ay: 0,
     pathLen: 0, maxDisplacement: 0, angularAccum: 0, forwardProg: 0,
@@ -85,6 +104,10 @@ export function readState(c) {
  */
 export const PROPRIO_DIM = 42;
 
+/** Gesamte Eingangsdimension = Propriozeption + alle Sinne. */
+export const SENSE_DIM = ECHO_DIM + CHEM_DIM + LIGHT_DIM + HEAR_DIM + 6;
+export const INPUT_DIM = PROPRIO_DIM + SENSE_DIM;
+
 export function readProprio(c, out) {
   const w = c.world;
   readState(c);
@@ -99,13 +122,18 @@ export function readProprio(c, out) {
     curlSum += armCurl(w, arm);
     if (!arm.grip.broken) anchored++;
   }
-  for (let a = 0; a < c.arms.length; a++) out[i++] = shoulder[a] / BODY.shoulderLimit;
-  for (let a = 0; a < c.arms.length; a++) out[i++] = curlSum ? armCurl(w, c.arms[a]) / BODY.jointLimit : 0;
+  // Normierung hart klemmen: der einseitige Hard-Stop der Gelenkgrenze erlaubt
+  // leichtes Überschwingen, gemessen bis 1.61× des Limits. Ohne Klemmung wäre
+  // der Eingangsvektor nicht normiert und ein Netz mit tanh-Ausgängen bekäme
+  // Inkonsistenzen zwischen Trainings- und Grenzbetrieb.
+  const cl = (v, m) => v > m ? m : (v < -m ? -m : v);
+  for (let a = 0; a < c.arms.length; a++) out[i++] = cl(shoulder[a] / BODY.shoulderLimit, 1.2);
+  for (let a = 0; a < c.arms.length; a++) out[i++] = cl(armCurl(w, c.arms[a]) / BODY.jointLimit, 1.2);
   for (let a = 0; a < c.arms.length; a++) {
     const t = tipPosition(w, c.arms[a]);
     const dx = t.x - c.x, dy = t.y - c.y;
-    out[i++] = (dx * ca - dy * sa) / ARM_REACH;
-    out[i++] = (dx * sa + dy * ca) / ARM_REACH;
+    out[i++] = cl((dx * ca - dy * sa) / ARM_REACH, 1.2);
+    out[i++] = cl((dx * sa + dy * ca) / ARM_REACH, 1.2);
   }
   for (let a = 0; a < c.arms.length; a++) {
     const g = c.arms[a].grip;
@@ -137,6 +165,9 @@ export function readProprio(c, out) {
 export function applyControl(c, control) {
   const w = c.world;
   c.tone = Math.max(0, Math.min(1, control.tone));
+  // Echolot-Aussendung ist eine AKTION, kein Dauerzustand: das Netz setzt den
+  // Wunsch, tickSenses() feuert, sobald der Cooldown frei ist.
+  c.echoWantsEmit = !!control.emitEcho;
   const comp = toneToCompliance(c.tone);
   for (let a = 0; a < c.arms.length; a++) {
     const arm = c.arms[a], st = c.perArm[a], ctl = control.arms[a];
@@ -169,6 +200,54 @@ export function applyControl(c, control) {
     }
   }
 }
+
+/**
+ * Alle Sinne abtasten und in `out` ab PROPRIO_DIM schreiben.
+ *
+ * Die Reihenfolge ist Teil der Schnittstelle und darf nicht mehr umgestellt
+ * werden, ohne bestehende Genome zu verwerfen:
+ *   [42..65]  Echolot: 12 Strahlen × (normierte Distanz, Intensität)
+ *   [66..71]  Chemorezeptorbogen, 6 Werte
+ *   [72..74]  Licht: links, rechts, gesamt
+ *   [75..78]  passives Gehör: 4 Quadranten
+ *   [79..84]  Tastkontakt pro Arm
+ */
+export function readSenses(c, out, entities) {
+  readState(c);
+  let o = PROPRIO_DIM;
+  o = writeEcho(c.echo, out, o);
+  o = writeChem(c.chem, out, o);
+  o = writeLight(c.light, out, o);
+  o = writeHear(c.hear, out, o);
+  for (let a = 0; a < c.contact.length; a++) out[o++] = c.contact[a];
+  return out;
+}
+
+/** Sinne fortschreiben — nach der Physik, vor dem nächsten Netz-Durchlauf. */
+export function tickSenses(c, sim) {
+  const w = c.world;
+  readState(c);
+  const dt = w.h * w.substeps;
+  const heading = c.angle - Math.PI * 0.5;   // Augen liegen bei lokalem -y
+  c.heading = heading;
+  tickEcho(c.echo, dt, sim.time);
+  if (c.echoWantsEmit) {
+    const loud = emitEcho(c.echo, sim.map, c.x, c.y, heading, sim.time);
+    if (loud > 0) { c.echoWantsEmit = false; c.lastEchoEmit = sim.time; c.echoLoudness = loud; }
+  }
+  sampleChem(c.chem, sim.entities, c.x, c.y, heading);
+  sampleLight(c.light, sim.map, c.x, c.y, heading);
+  sampleHear(c.hear, sim.entities, c.x, c.y);
+  c.hearBearing = hearBearing(c.hear, heading);
+  // Tastkontakt: Spitze nahe an der Karte?
+  for (let a = 0; a < c.arms.length; a++) {
+    const t = tipPosition(w, c.arms[a]);
+    const hit = sim.map.sdf(t.x, t.y);
+    const near = hit ? Math.max(0, 1 - hit.d / 9) : 0;
+    c.contact[a] = c.contact[a] * 0.7 + near * 0.3;
+  }
+}
+
 
 /** Messwerte VOR dem Physik-Schritt sichern. */
 export function preStep(c) {
@@ -221,6 +300,16 @@ export function stepSim(sim) {
   for (const c of sim.creatures) postStep(c);
   sim.time += sim.opts.h * sim.opts.substeps;
   sim.stepCount++;
+  // Welt-Update: Licht wandert, Entitäten bewegen sich und emittieren dabei,
+  // Sinne werden nachgeführt. Reihenfolge: erst Physik, dann Wahrnehmung —
+  // das Tier sieht den Zustand NACH seinem eigenen Schritt.
+  const dtS = sim.opts.h * sim.opts.substeps;
+  tickMapLights(sim.map, dtS);
+  if (sim.entities.length) {
+    const threats = sim.creatures.map(c => ({ x: c.x, y: c.y }));
+    for (const e of sim.entities) tickEntity(e, dtS, sim.map.width, sim.map.height, threats, sim.rnd);
+  }
+  for (const c of sim.creatures) tickSenses(c, sim);
 }
 
 /** Nur für Einzel-Tier-Tests: ein Tier in eigener Welt einen Schritt fahren. */

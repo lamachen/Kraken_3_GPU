@@ -57,7 +57,31 @@ export function makeMap(width, height, opts = {}) {
       if (gEnd < xs + cw - 14) rects.push({ x: gEnd, y: yl - wt / 2, w: xs + cw - gEnd, h: wt });
     }
   }
-  return { width, height, rects, sdf: makeSdf(rects) };
+  // Bewegliche Lichtquellen. Sehen ist damit konstruktionsbedingt intermittierend
+  // — eine Kreatur, die nur im Licht etwas wahrnimmt, hat eine echte Schwäche,
+  // die nicht als Regel programmiert ist sondern aus der Karte folgt.
+  const lights = [];
+  const palette = [[185, 255, 150], [90, 140, 255], [255, 215, 120], [200, 140, 255]];
+  for (let i = 0; i < (o.lights !== undefined ? o.lights : 4); i++) {
+    const sp = findSpawnRaw(width, height, T, rnd);
+    lights.push({ x: sp.x, y: sp.y, r: 220 + rnd() * 70, ir: 0.7 + rnd() * 0.12,
+                  c: palette[i % palette.length], ph: rnd() * Math.PI * 2, sp: 0.11 + rnd() * 0.06 });
+  }
+  return { width, height, rects, sdf: makeSdf(rects), lights, t: 0 };
+}
+
+function findSpawnRaw(width, height, pad, rnd) {
+  return { x: pad + rnd() * Math.max(1, width - pad * 2), y: pad + rnd() * Math.max(1, height - pad * 2) };
+}
+
+/** Lichtquellen wandern lassen — pro Sim-Schritt aufrufen. */
+export function tickMapLights(map, dt) {
+  map.t += dt;
+  for (const l of map.lights || []) {
+    const a = map.t * l.sp + l.ph;
+    l.x = Math.max(60, Math.min(map.width - 60, l.x + Math.cos(a) * 18 * dt));
+    l.y = Math.max(60, Math.min(map.height - 60, l.y + Math.sin(a * 0.8) * 18 * dt));
+  }
 }
 
 /**

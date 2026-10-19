@@ -25,5 +25,12 @@ export function demoControl(c, step) {
     };
   });
   void ph; void pull;
-  return { tone: 0.55 + 0.4 * pull, arms };
+  return {
+    tone: 0.55 + 0.4 * pull,
+    arms,
+    // Echolot rhythmisch aussenden — im Viewer als violette Strahlen sichtbar,
+    // die ERST nach der Laufzeit 2·d/c erscheinen. Ab Milestone 3 entscheidet
+    // das Netz selbst, wann es ortet (und verrät sich damit).
+    emitEcho: (step % 26) === 0,
+  };
 }
