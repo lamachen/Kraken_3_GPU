@@ -120,7 +120,7 @@ voll gestellt   (900 N Grenze)  → hält unter demselben Zug
 ## Abnahme: `node tools/harness.js`
 
 ```
-22/22 Checks bestanden
+36/36 Checks bestanden
   passiv        exakt in Ruhe            Pfad 0.00e+0 px        (v2: 964 px)
   spawn         Pin-Verletzung 0         max 0.000e+0 px        (v2: 56.94 px)
   spawn-motor   Muskelziele = Spawn-Pose
@@ -140,7 +140,38 @@ voll gestellt   (900 N Grenze)  → hält unter demselben Zug
   perf-linear   88 % Effizienz bei 64× Batch
   map-spawn     20/20 Karten mit voller Armfreiheit
   map-nogrip    keine dedizierten Greifpunkte
+
+  echo-dist     Raymarch 60.8 px bei tatsächlich 60 px  (Fehler 0.80 px)
+  echo-latency  Echo verzögert: ETA 0.1360 s gegen 2·d/c = 0.1351 s
+  echo-cooldown Refraktärzeit blockt und ist danach wieder frei
+  echo-loud     Aussendung ist hörbar (loudness 1.0) — wer ortet, verrät sich
+  hear-bearing  Peilung zur Quelle: größter Fehler 0° über 6 Richtungen
+  hear-falloff  60 px → 0.625,  140 px → 0.225  (quadratischer Abfall)
+  chem-gradient 4/4 Blickrichtungen korrekt zur Quelle aufgelöst
+  chem-range    700 px Abstand → peak 0.0000
+  light-falloff Quelle 0.850 > 220 px 0.173 > fern 0.050
+  light-ambient im Dunkeln nur 0.050 → Sehen ist konstruktionsbedingt intermittierend
+  input-dim     85 = 42 Propriozeption + 43 Sinne
+  input-finite  0 NaN/Inf über 400 Schritte
+  input-range   hart auf ±1.2 geklemmt (Hard-Stop erlaubt Überschwingen bis 1.61)
+  input-senses  25/43 Sinneswerte aktiv
 ```
+
+### Eingangs-Layout (Teil der Schnittstelle — nicht mehr umstellen, ohne Genome zu verwerfen)
+
+```
+[0..5]   Schulterwinkel pro Arm        [6..11]  mittlere Krümmung pro Arm
+[12..23] Spitze x/y im Rumpfsystem     [24..29] Zuglast am Saugnapf
+[30..35] haftet gerade (0/1)           [36..41] Rumpf: Beschleunigung längs/quer,
+                                                tragende Arme, Extension, Tempo, ω
+[42..65] Echolot, 12 Strahlen × (Distanz, Intensität)
+[66..71] Chemorezeptorbogen, 6 Werte   [72..74] Licht links/rechts/gesamt
+[75..78] passives Gehör, 4 Quadranten  [79..84] Tastkontakt pro Arm
+```
+
+Zwei Harness-Checks waren zunächst selbst falsch geschrieben und sind korrigiert:
+der Cooldown-Test maß nach Ablauf der Refraktärzeit (dann ist sie korrekt frei),
+und der Gehör-Test las `c.x` vor dem ersten Sim-Schritt (`undefined + 60 = NaN`).
 
 ### Performance
 
@@ -163,9 +194,14 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
 
 1. **[fertig] Kern + Physik.** XPBD-Referenzlöser, Körpermodell, Karte,
    Propriozeption, 22 Abnahme-Checks, Viewer.
-2. **Sinne.** Echolot per SDF-Raymarching (trainings-tauglich: kein Wellenfeld
-   pro Tier), Chemorezeption, Photorezeption. Im Spiel bleibt das Wellenfeld mit
-   gegenseitigem Hören — dieselbe Sensor-Schnittstelle, zwei Implementierungen.
+2. **[fertig] Sinne.** Echolot per SDF-Raymarching **mit Laufzeit** — kein
+   Entfernungssensor, sondern ein Gehör: das Tier sieht die Vergangenheit, nach
+   Entfernung gestaffelt. Chemorezeption über einen Rezeptorbogen,
+   Photorezeption gegen wandernde Lichtquellen, passives Gehör über vier
+   Quadranten mit Richtungsauflösung, Tastkontakt pro Arm. Dazu Entitäten
+   (Beute) als Duft- und Geräuschquellen. Eingang 42 → **85 Dimensionen**.
+   Im Spiel bleibt das Wellenfeld mit gegenseitigem Hören — dieselbe
+   Sensor-Schnittstelle (`write(out, offset)`), zwei Implementierungen.
 3. **Gehirn + Evolution + GPU.** WGSL-Portierung des Solvers gegen das Oracle
    getestet, NN als batched Matmul, Natural Evolution Strategies (nicht CMA-ES:
    bei 5307 Dimensionen wäre die Kovarianzmatrix 112 MB plus Eigenzerlegung).

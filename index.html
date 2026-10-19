@@ -21,19 +21,27 @@
 <body>
 <canvas id="c"></canvas>
 <div id="hud">
-  <span><b>Kraken 3 GPU</b> <span class="dim">Milestone 1 — XPBD-Referenzlöser</span></span>
+  <span><b>Kraken 3 GPU</b> <span class="dim">Milestone 2 — Physik + Sinne</span></span>
   <span>Schritte <b id="steps">0</b></span>
   <span>Sim-Zeit <b id="time">0.0</b> s</span>
   <span>Kraken-Schritte/s <b id="sps">0</b></span>
   <span>Tiere <b id="count">1</b></span>
   <span>verankert <b id="anch">0</b>/6</span>
   <span>max|v| <b id="mv">0</b> px/s</span>
+  <span class="dim">│ Sinne:</span>
+  <span>Echo <b id="se">0</b>/12</span>
+  <span>Chem <b id="sc">0</b></span>
+  <span>Licht <b id="sl">0</b></span>
+  <span>Gehör <b id="sh">0</b></span>
+  <span>Tast <b id="st">0</b>/6</span>
 </div>
 <div id="note">
   Kein Gehirn, kein Framework, keine Physik-Engine. Der Gang ist ein Platzhalter-Controller
   (<span class="dim">src/render/demo.js</span>), die Bewegung entsteht ausschließlich aus
   Gelenk-Compliance und Saugnapf-Adhäsion — es wirkt keine Kraft auf den Mantel.
-  <br>Abnahme: <a href="https://github.com/lamachen/Kraken_3_GPU/blob/main/tools/harness.js">tools/harness.js</a> · 22/22 Checks
+  <br>Abnahme: <a href="https://github.com/lamachen/Kraken_3_GPU/blob/main/tools/harness.js">tools/harness.js</a> · 36/36 Checks
+  <br>Violette Strahlen sind <b>eingetroffene</b> Echos — sie erscheinen erst nach der
+  Laufzeit 2·d/c, das Tier sieht also die Vergangenheit, nach Entfernung gestaffelt.
   <br><span class="dim">Tasten: [1…4] = 1/4/16/64 Tiere · Leertaste = Pause · R = neu würfeln</span>
 </div>
 <script type="module">
@@ -42,13 +50,13 @@ import { createView } from './src/render/view.js';
 import { demoControl } from './src/render/demo.js';
 
 let count = 1, paused = false, seed = 7;
-let sim = createSim({ seed, creatures: count });
+let sim = createSim({ seed, creatures: count, prey: 4 });
 const view = createView(document.getElementById('c'), sim);
 document.getElementById('count').textContent = count;
 
 function rebuild(n, s) {
   count = n; if (s !== undefined) seed = s;
-  sim = createSim({ seed, creatures: count });
+  sim = createSim({ seed, creatures: count, prey: 4 });
   view2 = createView(document.getElementById('c'), sim);
   document.getElementById('count').textContent = count;
 }
@@ -78,9 +86,15 @@ function loop() {
   el('time').textContent = sim.time.toFixed(1);
   const w = sim.world;
   el('mv').textContent = w.stats.maxSpeed.toFixed(0);
+  const c0 = sim.creatures[0];
   let anch = 0;
-  for (const arm of sim.creatures[0].arms) if (!arm.grip.broken) anch++;
+  for (const arm of c0.arms) if (!arm.grip.broken) anch++;
   el('anch').textContent = anch;
+  el('se').textContent = c0.echo.range_.filter(v => v > 0).length;
+  el('sc').textContent = c0.chem.peak.toFixed(2);
+  el('sl').textContent = c0.light.total.toFixed(2);
+  el('sh').textContent = c0.hear.peak.toFixed(2);
+  el('st').textContent = c0.contact.filter(v => v > 0.15).length;
 }
 loop();
 
