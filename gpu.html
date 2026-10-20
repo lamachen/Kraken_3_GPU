@@ -142,7 +142,7 @@ try {
       'Hintergrund: eine frühere Version dieser Seite legte pro Szenario ein eigenes ' +
       'WebGPU-Device an und gab es nie frei. Das kann den GPU-Prozess crashen — ' +
       'der Leak ist behoben (Commit 5b9c03d), aber ein bereits gecrashter Prozess ' +
-      'erholt sich erst mit einem Browser-Neustart.');
+      'erholt sich erst mit einem Browser-Neustart.\n      SCHNELLTEST: gpu-min.html oeffnen — eine einzige requestAdapter()-Anfrage, keine Module.\n      Scheitert sie ebenfalls, ist es der Browser-/Treiberzustand, nicht der Code.');
   }
   envRow('Adapter', (adapter.isFallbackAdapter ? 'Fallback (WARP/Software)' : 'Hardware') + '  ·  Anfrage-Variante: ' + usedVariant,
     adapter.isFallbackAdapter ? 'warn' : 'ok');
