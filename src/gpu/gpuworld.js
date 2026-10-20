@@ -104,6 +104,7 @@ export async function create(cpu, map, wgslSource, device) {
   const pipelineLayout = device.createBindGroupLayout ? device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }) : null;
   const mk = (entry) => device.createComputePipeline({ layout: pipelineLayout, compute: { module, entryPoint: entry } });
   const pipelines = {
+    resetLambda: mk('resetLambda'),
     integrate: mk('integrate'),
     solveConstraints: mk('solveConstraints'),
     solveCollisions: mk('solveCollisions'),
@@ -268,6 +269,8 @@ export function substep(g) {
   const enc = d.createCommandEncoder();
   const pass = () => { const p = enc.beginComputePass(); return p; };
   let p = pass();
+  p.setPipeline(g.pipelines.resetLambda); p.setBindGroup(0, g.bindGroup);
+  p.dispatchWorkgroups(disp(g.nC));
   p.setPipeline(g.pipelines.integrate); p.setBindGroup(0, g.bindGroup);
   p.dispatchWorkgroups(disp(g.nB)); p.end();
   for (let it = 0; it < g.cpu.iterations; it++) {
@@ -284,7 +287,7 @@ export function substep(g) {
   p.setPipeline(g.pipelines.finalize); p.setBindGroup(0, g.bindGroup);
   p.dispatchWorkgroups(disp(g.nB)); p.end();
   d.queue.submit([enc.finish()]);
-  g.dispatches += 2 + g.cpu.iterations * 2 + 1;
+  g.dispatches += 3 + g.cpu.iterations * 2 + 1;
 }
 
 export async function step(g) {

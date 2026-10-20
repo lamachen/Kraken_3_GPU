@@ -122,6 +122,22 @@ fn sdf(x: f32, y: f32) -> SdfHit {
   return SdfHit(best, bnx, bny, true);
 }
 
+// ══ 0. Lambda-Reset pro Substep ════════════════════════════════════
+// XPBD akkumuliert den Lagrange-Multiplikator ÜBER DIE ITERATIONEN EINES
+// SUBSTEPS; der Compliance-Term α̃·λ darf nicht über Substep-Grenzen wachsen.
+// Die CPU-Fassung resettet in _solvePin/_solveAngle beim ersten Iterations-
+// durchlauf (firstIteration-Flag). Ohne dieses Kernel wuchs λ auf der GPU
+// unbegrenzt: gemessen passiv 13.85 px Drift und max|v| exakt am 360-px/s-Limit,
+// während die CPU bei 1.36e-10 stand.
+@compute @workgroup_size(64)
+fn resetLambda(@builtin(global_invocation_id) gid: vec3u) {
+  let k = gid.x;
+  if (k >= P.nConstraints) { return; }
+  var c = cons[k];
+  c.lamX = 0.0; c.lamY = 0.0; c.lam = 0.0;
+  cons[k] = c;
+}
+
 // ══ 1. Integration: Kräfte, Dämpfung, Limits, Prädiktion ══════════
 @compute @workgroup_size(64)
 fn integrate(@builtin(global_invocation_id) gid: vec3u) {
