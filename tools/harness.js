@@ -788,6 +788,89 @@ if (want('gputrain')) {
   }
 }
 
+// ══════════════════════════════════════════════════════════════
+section('CHECK G7 — SOLVER-CHAOS-KLASSEN (Neukalibrierung der G7-Tore, M3c)');
+if (want('chaos')) {
+  // G7-Hardwaremessung (RTX 3070 Ti, fb622c8): maxΔ 32.69 px, 4.07 % Flag-Flips,
+  // pathLen -3.99 % — die alten Tore (< 0.5 px / ≥ 99 %) FAILten. Nachmessung
+  // (tools/lyap-, inject-, breaktiming-, order-, f32parity-probe + f32solver):
+  // Die Dynamik ist KONTRAKTIV gegen Zustandsstörungen, aber CHAOTISCH gegen
+  // Solver-Internika (Ordnung, f32-Arithmetik):
+  //   Zustandsrauschen 1e-3 px/Schritt   → maxΔ 0.0042 px  (absorbiert)
+  //   Bruchkraft-Rauschen 1e-2 relativ   → maxΔ 0.1477 px  (absorbiert)
+  //   Solve-Ordnung gedreht (reines f64!)→ maxΔ 35.35 px, pathLen +25.3 %
+  //   f32-Emulation per-op, gleiche Ordnung → 0.78 px (seed 7), 19.3 px (seed 13)
+  // Die Checks unten pinnen beide Seiten der Fehlerklasse, damit die
+  // In-Browser-Selbstkalibrierung von G7 (Kontrolle = Ordnung gedreht)
+  // eine gültige Referenz bleibt. gpu.html G7-Tor: maxΔ_GPU ≤ 3× maxΔ_Kontrolle.
+  const { createTrainer } = await import('../src/sim/train.js');
+  const { gpuTrainStep, beginGenerationGpu } = await import('../src/sim/gputrain.js');
+  const OPTS = { popSize: 8, stepsPerGen: 150, seed: 7, prey: 2 };
+
+  async function lockstep(mutateB) {
+    const A = createTrainer(OPTS), B = createTrainer(OPTS);
+    beginGenerationGpu(A, null);
+    beginGenerationGpu(B, null);
+    if (mutateB) mutateB(B);
+    let maxD = 0, mism = 0;
+    for (let s = 0; s < 150; s++) {
+      await gpuTrainStep(A, null);
+      await gpuTrainStep(B, null);
+      for (let i = 0; i < OPTS.popSize; i++) {
+        const ca = A.sim.creatures[i], cb = B.sim.creatures[i];
+        const d = Math.hypot(ca.x - cb.x, ca.y - cb.y);
+        if (d > maxD) maxD = d;
+        for (let a = 0; a < 6; a++) {
+          if (ca.arms[a].grip.broken !== cb.arms[a].grip.broken) mism++;
+        }
+      }
+    }
+    const pl = (tr) => tr.sim.creatures.reduce((sum, c) => sum + c.pathLen, 0) / OPTS.popSize;
+    return { maxD, mism, plA: pl(A), plB: pl(B), nan: A.sim.world.stats.nan + B.sim.world.stats.nan };
+  }
+
+  // a) Zustandsrauschen wird absorbiert — Zustandstore (G1/G2) bleiben gültig
+  {
+    const rnd = mulberry32(123);
+    const r = await lockstep((tr) => {
+      const w = tr.sim.world, orig = w.step.bind(w);
+      w.step = function () {
+        for (let i = 0; i < w.n; i++) {
+          w.px[i] += (rnd() * 2 - 1) * 1e-3;
+          w.py[i] += (rnd() * 2 - 1) * 1e-3;
+        }
+        orig();
+      };
+    });
+    check('noise-absorbed', 'Zustandsrauschen 1e-3 px/Schritt wird absorbiert (kontraktiv)',
+      r.maxD < 0.05 && r.mism <= 10,
+      `maxΔ ${r.maxD.toExponential(2)} px, Flips ${r.mism}/7200 (Referenz: 4.2e-3 px, 0 Flips)`);
+  }
+
+  // b) Solve-Ordnung gedreht (reines f64!) divergiert chaotisch — die Klasse existiert
+  {
+    const r = await lockstep((tr) => { tr.sim.world.constraints.reverse(); });
+    check('order-chaos', 'Solve-Ordnung gedreht (f64) divergiert chaotisch — Klasse existiert',
+      r.maxD > 1,
+      `maxΔ ${r.maxD.toFixed(2)} px, Flips ${r.mism}/7200, pathLen ${r.plA.toFixed(2)}→${r.plB.toFixed(2)} ` +
+      `(Referenz: 35.35 px, 236 Flips, +25.3 %) — Schritt-Parität ist zwischen gültigen Solvern unerreichbar`);
+  }
+
+  // c) f32-Solver-Emulation (gleiche Ordnung, per-op fround) bleibt in der Klasse
+  {
+    const { f32ify } = await import('./f32solver.mjs');
+    const r = await lockstep((tr) => {
+      const emu = f32ify(tr.sim.world, tr.sim.map);
+      emu.roundState();   // = upload(): Anfangszustand als f32
+    });
+    check('f32-class', 'f32-Emulation (per-op, gleiche Ordnung): NaN 0, maxΔ < 40 px, pathLen ±6 %',
+      r.nan === 0 && r.maxD < 40 && Math.abs(r.plB - r.plA) < 0.06 * Math.max(r.plA, 1e-9),
+      `maxΔ ${r.maxD.toFixed(3)} px, pathLen ${r.plA.toFixed(2)}→${r.plB.toFixed(2)}, NaN ${r.nan} ` +
+      `(Referenz seed 7: 0.78 px/+0.24 %; GPU-Messung 32.7 px liegt in Klasse [0.8, 35.4])`);
+  }
+}
+
+
 section('CHECK 11 — KARTEN-ABDECKUNG / SPAWN');
 if (want('map')) {
   const map = makeMap(1440, 810, { seed: 7 });

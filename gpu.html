@@ -50,7 +50,9 @@ button:hover{border-color:#0f8;background:rgba(0,255,128,.1)}
 <h2>Durchsatz</h2>
 <table id="perf"><thead><tr><th>Tiere (Lanes)</th><th class="num">CPU Kraken-Schritte/s</th><th class="num">GPU Kraken-Schritte/s</th><th class="num">Faktor</th></tr></thead><tbody></tbody></table>
 
-<h2>Log</h2>
+<h2 style="display:flex;align-items:center;gap:12px">Log
+  <button id="copyLog" style="padding:3px 12px;font-size:11px">📋 Log kopieren</button>
+</h2>
 <pre id="log"></pre>
 
 <script type="module">
@@ -65,6 +67,25 @@ import { gpuTrainStep, beginGenerationGpu, runGpuTraining, gpuBackend } from './
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
 const say = (m) => { logEl.textContent += m + '\n'; };
+$('copyLog').addEventListener('click', async (ev) => {
+  const b = ev.currentTarget;
+  const txt = logEl.textContent;
+  let ok = false;
+  try {
+    await navigator.clipboard.writeText(txt);
+    ok = true;
+  } catch {
+    // Fallback für Kontexte ohne Clipboard-API (z. B. file:// ohne Permissions)
+    const ta = document.createElement('textarea');
+    ta.value = txt;
+    ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { ok = document.execCommand('copy'); } catch { ok = false; }
+    ta.remove();
+  }
+  b.textContent = ok ? '✓ kopiert' : '✗ fehlgeschlagen';
+  setTimeout(() => { b.textContent = '📋 Log kopieren'; }, 1400);
+});
 const row = (t, cells) => {
   const tr = document.createElement('tr');
   tr.innerHTML = `<td>${t}</td>` + cells.map(c => `<td>${c}</td>`).join('');
@@ -411,47 +432,92 @@ for (const N of [1, 64, 512]) {
   if (err && N === 1) fatal('GPU-Durchsatz fehlgeschlagen: ' + err);
 }
 
-// ── G7: Hybrid-Trainer — f32-Spiegel-Parität im Lockstep (M3c) ─
-// Zwei identische Trainer (seed 7, pop 8, 2 Beuten): A läuft auf dem
-// f64-CPU-Oracle, B auf der GPU inkl. mirrorInto()-Rückspiegelung. Dieselben
-// Genome, dieselben Sinne, dieselbe Steuerlogik — nur die Physik differs.
-// Headless-Vormessung (f32-Rundungs-Mock des CPU-Solvers): max Mantel-Δ
-// 0.0005 px, 0/900 Grip-Flag-Differenzen über 150 Schritte. Die Tore unten
-// lassen 1000× Luft bis zu dieser Marke — was darüber liegt, ist keine
-// Numerik, sondern ein Fehler (Race, Control-Pfad, Spiegel-Feld).
-say('\n--- G7 Hybrid-Trainer: Spiegel-Parität ---');
+// ── G7: Hybrid-Trainer — Solver-Klassen-Parität (M3c, redesign) ────
+// Ursprüngliches Design (fb622c8): Lockstep-Schritt-Parität, Tore maxΔ < 0.5 px
+// und Grip-Flags ≥ 99 %, abgeleitet aus dem f32-Mock (0.0005 px). Hardware-
+// Messung RTX 3070 Ti: maxΔ 32.69 px, 4.07 % Flag-Flips, pathLen -3.99 % — FAIL.
+// Headless-Nachmessung (tools/inject-, breaktiming-, order-, f32parity-probe):
+//
+//   Störklasse                             maxΔ/150 Schr.  pathLen-Δ
+//   Zustandsrauschen 1e-3 px/Schritt       0.0042 px       ~0 %    → absorbiert
+//   Bruchkraft-Rauschen 1e-2 relativ       0.1477 px       +0.1 %  → absorbiert
+//   f32-Emulation per-op, gleiche Ordnung  0.78…19.3 px    ≤ +2.1 %→ Klasse
+//   Solve-Ordnung gedreht (reines f64!)    35.35 px        +25.3 % → Klasse
+//   echte GPU (RTX 3070 Ti)                32.69 px        -4.0 %  → Klasse
+//
+// Die Dynamik ist KONTRAKTIV gegen Zustandsstörungen, aber CHAOTISCH gegen
+// Solver-Internika (f32-Arithmetik, Trig-ulp, fma-Kontraktion, Solve-Ordnung):
+// Unterschiede im Solve verschieben diskrete Ereignisse (Grip-Bruch, Slip-Gate,
+// Beute-Fluchtgate 260 px, Panic-Tempo-Umschaltung) um ±1 Schritt — danach
+// verfolgen zwei gültige Physiken verschiedene Trajektorien. Selbst eine
+// f64-CPU mit gedrehter Constraint-Ordnung weicht im Fitness-Rohwert STÄRKER
+// ab (+25 %) als die echte GPU (-4 %): Schritt-Parität ist zwischen zwei
+// gültigen Solver-Implementierungen unerreichbar — dasselbe Fazit wie damals
+// bei der Bit-Identität. Deshalb: STATISTISCHE Tore + IN-SITU-SELBSTKALIBRIERUNG.
+// Kontrolle C (Ordnung gedreht, reines f64) misst die Klassenschranke im
+// selben Szenario auf derselben Maschine; die GPU muss innerhalb von 3×
+// dieser Schranke bleiben. pop 32 statt 8: Fitness-Rohgrößen mitteln das
+// Realisierungs-Pech einzelner Tiere heraus.
+say('\n--- G7 Hybrid-Trainer: Solver-Klassen-Parität ---');
 {
-  const OPTS = { popSize: 8, stepsPerGen: 150, seed: 7, prey: 2 };
+  const OPTS = { popSize: 32, stepsPerGen: 150, seed: 7, prey: 2 };
   const STEPS = 150;
-  const A = createTrainer(OPTS);            // Oracle: reine CPU-Physik
+  const A = createTrainer(OPTS);            // Oracle: reine CPU-Physik (f64)
   const B = createTrainer(OPTS);            // Hybrid: GPU-Physik + Spiegel
+  const C = createTrainer(OPTS);            // Kontrolle: CPU-Physik, Ordnung gedreht
   const gpu = await create(B.sim.world, B.sim.map, wgsl, device);
   const backend = gpuBackend(gpu);
   beginGenerationGpu(A, null);
   beginGenerationGpu(B, backend);
-  let maxD = 0, sumD = 0, gripMism = 0, gripTot = 0;
+  beginGenerationGpu(C, null);
+  C.sim.world.constraints.reverse();        // dieselbe Physik, andere Solve-Ordnung
+
+  const mk = () => ({ maxD: 0, sumD: 0, mism: 0, tot: 0, onlyOracle: 0, onlyVar: 0,
+                      firstFlip: -1, brkA: 0, brkB: 0, preyD: 0, worstI: -1 });
+  const S = mk(), K = mk();                 // S = GPU vs Oracle, K = Kontrolle vs Oracle
   for (let s = 0; s < STEPS; s++) {
     await gpuTrainStep(A, null);
     await gpuTrainStep(B, backend);
+    await gpuTrainStep(C, null);
     for (let i = 0; i < OPTS.popSize; i++) {
-      const ca = A.sim.creatures[i], cb = B.sim.creatures[i];
-      const d = Math.hypot(ca.x - cb.x, ca.y - cb.y);
-      if (d > maxD) maxD = d;
-      sumD += d;
-      for (let a = 0; a < 6; a++) {
-        gripTot++;
-        if (ca.arms[a].grip.broken !== cb.arms[a].grip.broken) gripMism++;
+      const ca = A.sim.creatures[i];
+      for (const [T, o] of [[S, B.sim.creatures[i]], [K, C.sim.creatures[i]]]) {
+        const d = Math.hypot(ca.x - o.x, ca.y - o.y);
+        if (d > T.maxD) { T.maxD = d; T.worstI = i; }
+        T.sumD += d;
+        for (let a = 0; a < 6; a++) {
+          T.tot++;
+          const fa = ca.arms[a].grip.broken, fb = o.arms[a].grip.broken;
+          T.brkA += fa ? 1 : 0; T.brkB += fb ? 1 : 0;
+          if (fa !== fb) {
+            T.mism++;
+            if (T.firstFlip < 0) T.firstFlip = s;
+            if (fa) T.onlyOracle++; else T.onlyVar++;
+          }
+        }
       }
+    }
+    for (let e = 0; e < A.sim.entities.length; e++) {
+      const ea = A.sim.entities[e];
+      const eb = B.sim.entities[e], ec = C.sim.entities[e];
+      S.preyD = Math.max(S.preyD, Math.hypot(ea.x - eb.x, ea.y - eb.y));
+      K.preyD = Math.max(K.preyD, Math.hypot(ea.x - ec.x, ea.y - ec.y));
     }
   }
   const nanA = A.sim.world.stats.nan, nanB = B.sim.world.stats.nan;
-  const plA = A.sim.creatures.reduce((s, c) => s + c.pathLen, 0) / OPTS.popSize;
-  const plB = B.sim.creatures.reduce((s, c) => s + c.pathLen, 0) / OPTS.popSize;
-  verdict('G7 NaN', 'Lockstep 8 Tiere × 150 NN-Schritte, Beute aktiv', nanA, nanB, nanA === 0 && nanB === 0, false);
-  verdict('G7 max Δpos', `Größte Mantel-Abweichung über ${STEPS} Schritte (f32-Mock: 0.0005 px)`, 0, maxD, maxD < 0.5, '< 0.5 px');
-  verdict('G7 Grip-Flags', `Übereinstimmung der Saugnapf-Zustände (${gripTot} Vergleiche)`, 100, 100 * (1 - gripMism / gripTot), gripMism / gripTot < 0.01, '≥ 99 %');
-  verdict('G7 Pfadlänge', 'Ø zurückgelegter Weg — die Fitness-Rohgröße', plA, plB, Math.abs(plA - plB) < 0.05 * Math.max(plA, 1) + 1e-9, '±5 %');
-  say(`    mean Δpos: ${(sumD / (STEPS * OPTS.popSize)).toFixed(6)} px · Grip-Mismatches: ${gripMism}/${gripTot}`);
+  const pl = (tr) => tr.sim.creatures.reduce((s, c) => s + c.pathLen, 0) / OPTS.popSize;
+  const plA = pl(A), plB = pl(B), plC = pl(C);
+  const bound = Math.max(1, 3 * K.maxD);
+  verdict('G7 NaN', `Lockstep ${OPTS.popSize} Tiere × ${STEPS} NN-Schritte, Beute aktiv, f64-Kontrolle mitläufig`, nanA, nanB, nanA === 0 && nanB === 0, false);
+  verdict('G7 Klassen-Schranke', `maxΔ GPU ≤ 3× maxΔ Kontrolle (Ordnung gedreht, f64: ${K.maxD.toFixed(2)} px)`, K.maxD, S.maxD, S.maxD <= bound, '≤ 3× Kontrolle');
+  verdict('G7 Grip-Flags', `Saugnapf-Zustände stimmen überein (${S.tot} Vergleiche; Kontrolle: ${(100 * (1 - K.mism / K.tot)).toFixed(2)} %)`, 100, 100 * (1 - S.mism / S.tot), S.mism / S.tot < 0.10, '≥ 90 %');
+  verdict('G7 Bruch-Ereignisse', 'Σ gebrochene Saugnapf-Schritte über alle Tiere (Oracle → GPU)', S.brkA, S.brkB, Math.abs(S.brkB - S.brkA) <= Math.max(3, 0.25 * S.brkA), '±25 %');
+  verdict('G7 Pfadlänge', 'Ø zurückgelegter Weg — die Fitness-Rohgröße', plA, plB, Math.abs(plA - plB) < 0.10 * Math.max(plA, 1), '±10 %');
+  say(`    Kontrolle (Ordnung gedreht, f64):  maxΔ ${K.maxD.toFixed(4)} px · mean ${(K.sumD / (STEPS * OPTS.popSize)).toFixed(4)} · Flags ${(100 * (1 - K.mism / K.tot)).toFixed(2)} % · Brüche ${K.brkA}→${K.brkB} · pathLen ${plC.toFixed(2)} (${(100 * (plC - plA) / Math.max(plA, 1e-9)).toFixed(1)} %) · Beute-Δ ${K.preyD.toFixed(2)} px`);
+  say(`    GPU:                             maxΔ ${S.maxD.toFixed(4)} px · mean ${(S.sumD / (STEPS * OPTS.popSize)).toFixed(4)} · Flags ${(100 * (1 - S.mism / S.tot)).toFixed(2)} % · Brüche ${S.brkA}→${S.brkB} · pathLen ${plB.toFixed(2)} (${(100 * (plB - plA) / Math.max(plA, 1e-9)).toFixed(1)} %) · Beute-Δ ${S.preyD.toFixed(2)} px`);
+  say(`    GPU-Detail: 1. Flip @ Schritt ${S.firstFlip} · Flip-Richtung Oracle-only ${S.onlyOracle}, GPU-only ${S.onlyVar} · größtes Δ bei Tier ${S.worstI}`);
+  say('    Klassen-Einordnung: Zustandsebene kontraktiv (Rauschen 1e-3 px/Schr → 0.004 px), Solver-Internika chaotisch');
+  say('    (Ordnung gedreht f64 → 35.4 px/+25 % pathLen; f32-Emulation → 0.8…19.3 px). Kopflos pinnt tools/harness.js --only chaos.');
   destroy(gpu);
 }
 

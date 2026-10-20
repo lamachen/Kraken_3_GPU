@@ -62,9 +62,11 @@ src/gpu/solver.wgsl    WGSL-Port des Solvers (Jacobi, f32, sequentielle Farb-Dis
 src/gpu/gpuworld.js    Buffer/Bind-Groups, upload/packControls, step, download/mirrorInto.
 src/sim/gputrain.js    Hybrid-Trainer: Physik GPU, Sinne/Netz/ES CPU, Zustandsspiegel.
 src/render/            EINZIGE DOM-abhängige Schicht (view.js) + Platzhalter-Gang (demo.js).
-tools/harness.js       53 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
+tools/harness.js       56 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
 tools/profile-step.js  Zerlegt den Tier-Schritt in Phasen (µs) — Architektur-Entscheide.
 tools/mocktrain.js     Hybrid-Trainer headless ohne Device (Passthrough/f32-Mock).
+tools/f32solver.mjs    f32-Solver-Emulation (WGSL-Semantik per-op) — G7-Fehlerklassen.
+tools/*-probe.mjs      Messproben: Lyapunov, Injektion, Bruch-Timing, Ordnung, f32-Parität.
 ```
 
 `src/physics`, `src/world`, `src/body` und `src/sim` enthalten **keine einzige
@@ -125,7 +127,7 @@ voll gestellt   (900 N Grenze)  → hält unter demselben Zug
 ## Abnahme: `node tools/harness.js`
 
 ```
-53/53 Checks bestanden
+56/56 Checks bestanden
   passiv        exakt in Ruhe            Pfad 0.00e+0 px        (v2: 964 px)
   slack-fixpoint Störung < slack         Δ = 0.00e+0 px, v = 0  (f32-Boden: GPU driftete 1.28 px)
   slack-corrects 25× slack korrigiert    0.050 px → 1.95e-3 px
@@ -133,6 +135,9 @@ voll gestellt   (900 N Grenze)  → hält unter demselben Zug
   pack-controls Steuer-Packing + Anker   lbx/lby-Sync für den Re-Grip mitten in der Episode
   prey-determinism Beute aus Seed identisch (fix: makeEntity zog Math.random())
   gputrain-identical Hybrid = CPU-Trainer Fitness bit-identisch, 2 Gen × 8 Tiere × 120 Schritte
+  noise-absorbed Zustandsrauschen zerfällt 1e-3 px/Schritt → maxΔ 3.9e-3 px (kontraktiv)
+  order-chaos    Solve-Ordnung gedreht (f64!) maxΔ 35.35 px — Schritt-Parität unerreichbar
+  f32-class      f32-Emulation in der Klasse maxΔ 0.78 px, pathLen +0.24 %, NaN 0
   spawn         Pin-Verletzung 0         max 0.000e+0 px        (v2: 56.94 px)
   spawn-motor   Muskelziele = Spawn-Pose
   grip          verankerter Arm zieht    70.6 px = 72 %         (v2: 92…99 %)
@@ -289,7 +294,7 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
      ≥ 80 % des CPU-Spitzenwerts — „nur unter Limit" besteht sonst auch
      im Stillstand. G5 lädt die Steuerung seitdem ebenfalls hoch
      (Determinismus unter Muskellast, nicht nur im Ruhezustand).
-4. **[gebaut, Browser-Beweis offen: 3c] Hybrid-Trainer — Training auf der GPU.**
+4. **[fertig: 3c — auf Hardware validiert, G7-Tore neu kalibriert] Hybrid-Trainer — Training auf der GPU.**
    Profil zuerst (`tools/profile-step.js`, pop=32, µs pro Tier·Schritt):
 
    | Phase | µs | Anteil |
@@ -332,11 +337,54 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
    **Anker 37 → 99 %, best 176.7 → 383.5, Zyklen 0.44 → 2.75** — dieselbe
    Signatur wie M3a.
 
-   Browser-Beweise (gpu.html, noch zu fahren): **G7** Lockstep-Parität
-   (8 Tiere, 150 NN-Schritte, Tore aus der f32-Mock-Vormessung: max Δpos
-   0.0005 px → Tor 0.5 px; 0/900 Grip-Flag-Differenzen → Tor 99 %;
-   Pfadlänge ±5 %), **G8** Trainer-Durchsatz (pop 256, 2 Gen × 500 Schritte,
-   Tor ≥ 3× gegen die CPU-Kalibrierung; Erwartung aus Profil + G6: ~5–10×).
+   Browser-Beweise (gpu.html, RTX 3070 Ti, Build `fb622c8`): **G8**
+   Trainer-Durchsatz **20 596 Tier-Schritte/s = 6.8×** der CPU-Kalibrierung
+   (3010 Tier-Schritte/s), 512 Episoden in 12.4 s = 24.3 ms/Episode, und
+   gelernt wird durch die Mirror-Pipeline: Gen 0 → 1: best 248.5 → 324.1,
+   Anker 53 → 77 %, Zyklen 0.65 → 0.93. **G7** (Lockstep-Parität) FAILte
+   dagegen mit den aus dem f32-Mock abgeleiteten Toren: maxΔ 32.69 px statt
+   < 0.5 px, 4.07 % Grip-Flag-Flips statt < 1 % — die Nachmessung zeigte:
+   die Tore kalibrierten die falsche Fehlerklasse.
+
+   **Die zwei Fehlerklassen** (kopflos vermessen: `tools/lyap-`, `inject-`,
+   `breaktiming-`, `order-`, `f32parity-probe.mjs` + `f32solver.mjs`; als
+   Regression gepinnt: `node tools/harness.js --only chaos`):
+
+   | Störung (150 NN-Schritte, seed 7, pop 8, prey 2) | maxΔ Mantel | pathLen-Δ |
+   |---|---|---|
+   | Anfangsstörung 1e-7 px (Lyapunov-Probe) | 7e-9 px (zerfällt!) | 0 % |
+   | Zustandsrauschen 1e-3 px/Schritt, alle Körper | 0.0042 px | ~0 % |
+   | Bruchkraft-Rauschen 1e-2 relativ | 0.1477 px | +0.1 % |
+   | f32-Emulation per-op, gleiche Ordnung (3 Seeds) | 0.78 … 19.3 px | ≤ +2.1 % |
+   | **Solve-Ordnung gedreht — reines f64!** | **35.35 px** | **+25.3 %** |
+   | echte GPU (RTX 3070 Ti) | 32.69 px | **-4.0 %** |
+
+   Die Dynamik ist **kontraktiv gegen Zustandsstörungen** (Rauschen zerfällt),
+   aber **chaotisch gegen Solver-Internika** (f32-Arithmetik, Trig-ulp,
+   fma-Kontraktion, Solve-Ordnung): Unterschiede IM Solve verschieben
+   diskrete Ereignisse — Grip-Bruch, Slip-Gate, das 260-px-Fluchtgate der
+   Beute, die Panic-Tempo-Umschaltung (1× ↔ 2.1×) — um ±1 Schritt; danach
+   verfolgen zwei gültige Physiken verschiedene Trajektorien (gemessen:
+   Beute-Δ bis 35 px als Folge, nicht als Ursache). Eine f64-CPU mit
+   gedrehter Constraint-Ordnung weicht im Fitness-Rohwert STÄRKER ab (+25 %)
+   als die echte GPU (-4 %): Schritt-Parität ist zwischen zwei gültigen
+   Solver-Implementierungen so unerreichbar wie Bit-Identität. Der f32-Mock
+   (0.0005 px) hatte nur die Zustandsrunde getestet — die absorbierte
+   Klasse — und damit ein Tor kalibriert, das keine gültige GPU-Physik
+   bestehen kann. Die Verdrahtung selbst ist sauber: pack/mirror-Offsets
+   gegen das WGSL-Struct geprüft, `attachGrip`/`releaseGrip` schreiben nur
+   gepackte Felder, `ppx/angP` hat keinen CPU-Verbraucher, Constraint-
+   Ordnung ist CPU wie GPU identisch (core.js färbt und sortiert beim Spawn).
+
+   **G7-Redesign** (gpu.html, 18 Urteile): In-situ-Selbstkalibrierung statt
+   fester Marken — Kontrolle C = derselbe Trainer mit gedrehter Constraint-
+   Ordnung (reines f64, CPU vs CPU) misst die Klassenschranke im selben
+   Szenario auf derselben Maschine. Tore: **maxΔ_GPU ≤ 3× maxΔ_Kontrolle** ·
+   Grip-Flags ≥ 90 % (Messung: GPU 95.9 %, Kontrolle 96.7 %) · Bruch-
+   Ereignisse ±25 % · pathLen ±10 % · NaN exakt. pop 32 statt 8 mittelt das
+   Realisierungs-Pech einzelner Tiere aus den Fitness-Rohgrößen heraus.
+   Neu im Log: Flip-Richtung (Oracle-only vs GPU-only), 1.-Flip-Schritt,
+   Beute-Δ, Control-Statistik — plus **Kopier-Button** für den Gesamtlog.
 
    Bekannte Grenze (Hebel für 3d): der Readback ist die VOLLWelt
    (4.6 MB/Schritt bei B=512, ~6–10 ms JS-Spiegel-Kosten) — ein kompakter
@@ -349,11 +397,13 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
 ## Lokal
 
 ```bash
-node tools/harness.js          # 53 Abnahme-Checks
+node tools/harness.js          # 56 Abnahme-Checks
+node tools/harness.js --only chaos          # G7-Fehlerklassen (absorbiert vs chaotisch)
 node tools/check-wgsl.js       # Shader/Binding-Konsistenz (ohne GPU)
 node tools/trainrun.js --gens 20 --pop 32   # CPU-Trainingslauf (~90 s)
 node tools/profile-step.js 32 400           # Phasen-Profil des Tier-Schritts
 node tools/mocktrain.js --gens 8            # Hybrid-Trainer headless (f32-Mock)
+node tools/f32parity-probe.mjs              # f64-Oracle vs f32-Solver-Emulation
 python3 -m http.server 8080    # oder: npx serve .   → http://localhost:8080
 ```
 
