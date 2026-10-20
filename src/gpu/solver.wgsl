@@ -45,7 +45,7 @@ struct Body {
 struct Constraint {
   aIdx: u32, bIdx: u32, cType: u32, owner: u32,
   lax: f32, lay: f32, lbx: f32, lby: f32,
-  compliance: f32, rest: f32, target: f32, minAng: f32,
+  compliance: f32, rest: f32, tgt: f32, minAng: f32,
   maxAng: f32, lamX: f32, lamY: f32, lam: f32,
   breakForce: f32, broken: u32, pad0: u32, pad1: u32,
 };
