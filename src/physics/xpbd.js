@@ -53,6 +53,30 @@ export const SOLVER_DEFAULTS = {
   maxAngSpeed: 18,     // rad/s  hartes Limit
 };
 
+/**
+ * Korrektur-Totzone (slack) — der f32-Boden des GPU-Ports.
+ *
+ * Die CPU rechnet Float64, WGSL Float32. Bei Koordinaten um 1440 px ist
+ * ulp(position) ≈ 1.7e-4 px; das in Float64 berechnete Spawn-Gleichgewicht ist
+ * nach der Rundung in die f32-Buffer deshalb KEIN exakter Fixpunkt mehr: der
+ * Solver sieht Mikro-Verletzungen (G2 gemessen, Build d487532: schlechteste
+ * Pin-Verletzung nach Upload 2.0e-4 px — exakt diese Größenordnung) und
+ * „korrigiert" sie in jedem Substep. `v = (pPred - p)/h` hebt das 1e-4-px-
+ * Zittern auf ~0.16 px/s Rauschgeschwindigkeit, die sich linear integriert:
+ * G1-Wachstum gemessen 1.2789 px nach 2400 Schritten, CPU-Oracle 3.4e-9.
+ * Kein Race und kein Formelfehler — die numerische Bodenhöhe von f32.
+ *
+ * Heilung: Korrekturen unterhalb slack werden übersprungen, in BEIDEN Solvern
+ * (Oracle-Vergleich bleibt 1:1, check-wgsl.js prüft die Parität). Ein Zustand
+ * mit allen |C| < slack und allen v = 0 ist damit ein BITEXAKTER Fixpunkt:
+ * pPred = p + h·0 = p, keine Projektion, v' = (p-p)/h = 0 — für immer.
+ * Echte Physik spielt 1–2 Zehnerpotenzen darüber: Muskelzug verformt Gelenke
+ * um ~0.01–1 px pro Substep, Grip-Lasten erzeugen |λ| weit über dem Band.
+ * 2e-3 px = 1/59 000 der Armreichweite (118.5 px) — physikalisch unsichtbar.
+ */
+export const SLACK_POS = 2e-3;   // px  — Pin-/Grip-Verletzung, Kollisions-Penetration
+export const SLACK_ANG = 2e-4;   // rad — Muskel-Abweichung, Gelenkgrenz-Überschuss (0.011°)
+
 /** Winkel auf (-π, π] wickeln — O(1), keine while-Schleife. */
 /**
  * Farben für race-freies paralleles Constraint-Solving.
@@ -317,6 +341,10 @@ export class XpbdWorld {
 
     let Cx = gax - gbx, Cy = gay - gby;
     if (!Number.isFinite(Cx) || !Number.isFinite(Cy)) return;
+    // Totzone (SLACK_POS): unterhalb des f32-Bodens gilt das Constraint als
+    // erfüllt. Ohne das integriert sich Rundungszittern über v = Δp/h zu
+    // dauerhafter Rauschgeschwindigkeit auf (G1 gemessen: 1.2789 px Drift).
+    if (Cx * Cx + Cy * Cy < SLACK_POS * SLACK_POS) return;
 
     // perp(r) = (-ry, rx) — Jacobian-Spalte zur Winkel-Freiheitsgrade
     const pax = -ray, pay = rax;
@@ -377,13 +405,17 @@ export class XpbdWorld {
     const C = angleDelta(dev, c.target);
     if (!Number.isFinite(C)) return;
 
-    const alphaTilde = c.compliance / (this.h * this.h);
-    const dl = -(C + alphaTilde * c.lambda) / (wSum + alphaTilde);
-    if (!Number.isFinite(dl)) return;
-    c.lambda += dl;
+    // Totzone (SLACK_ANG): Muskelkorrektur nur über dem f32-Boden. Ruhe-
+    // zustände (C ≈ 1e-6 rad aus Rundung) werden damit zu exakten Fixpunkten.
+    if (Math.abs(C) >= SLACK_ANG) {
+      const alphaTilde = c.compliance / (this.h * this.h);
+      const dl = -(C + alphaTilde * c.lambda) / (wSum + alphaTilde);
+      if (!Number.isFinite(dl)) return;
+      c.lambda += dl;
 
-    if (B >= 0) { angP[B] += wB * dl; angP[A] -= wA * dl; }
-    else        { angP[A] += wA * dl; }
+      if (B >= 0) { angP[B] += wB * dl; angP[A] -= wA * dl; }
+      else        { angP[A] += wA * dl; }
+    }
 
     // Gelenkgrenze als EINSEITIGE harte Nebenbedingung auf die Abweichung.
     const rel2 = B >= 0 ? angleDelta(angP[B], angP[A]) : angP[A];
@@ -391,7 +423,7 @@ export class XpbdWorld {
     let over = 0;
     if (dev2 > c.maxAngle) over = dev2 - c.maxAngle;
     else if (dev2 < c.minAngle) over = dev2 - c.minAngle;
-    if (over !== 0 && wSum > 0) {
+    if (Math.abs(over) >= SLACK_ANG && wSum > 0) {
       const dl2 = -over / wSum;
       if (B >= 0) { angP[B] += wB * dl2; angP[A] -= wA * dl2; }
       else        { angP[A] += wA * dl2; }
@@ -414,8 +446,11 @@ export class XpbdWorld {
       const wx = ppx[B] + cp.lx * ca - cp.ly * sa;
       const wy = ppy[B] + cp.lx * sa + cp.ly * ca;
       const hit = this.sdf(wx, wy);
-      if (!hit || hit.d >= cp.r) continue;
+      if (!hit) continue;
       const pen = cp.r - hit.d;
+      // Totzone: auch Penetration unter dem f32-Boden überspringen, sonst
+      // zittert ein aufliegender Körper dauerhaft (Kontakt-Rauschen).
+      if (pen <= SLACK_POS) continue;
       const w = im[B];
       if (w === 0) continue;
       // Vollständige Positionsprojektion entlang der Normalen (statisch, keine Karte)

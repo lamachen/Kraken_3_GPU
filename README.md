@@ -59,7 +59,7 @@ src/world/map.js       Rechteckkarte + analytisches Signed-Distance-Field.
 src/body/kraken.js     Körpermodell: Mantel + 6 Arme × 7 Segmente, 1 Saugnapf/Arm.
 src/sim/core.js        DOM-freier Simulationskern: Zustand, Propriozeption, Steuerung.
 src/render/            EINZIGE DOM-abhängige Schicht (view.js) + Platzhalter-Gang (demo.js).
-tools/harness.js       22 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
+tools/harness.js       49 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
 ```
 
 `src/physics`, `src/world`, `src/body` und `src/sim` enthalten **keine einzige
@@ -120,8 +120,10 @@ voll gestellt   (900 N Grenze)  → hält unter demselben Zug
 ## Abnahme: `node tools/harness.js`
 
 ```
-47/47 Checks bestanden
+49/49 Checks bestanden
   passiv        exakt in Ruhe            Pfad 0.00e+0 px        (v2: 964 px)
+  slack-fixpoint Störung < slack         Δ = 0.00e+0 px, v = 0  (f32-Boden: GPU driftete 1.28 px)
+  slack-corrects 25× slack korrigiert    0.050 px → 1.95e-3 px
   spawn         Pin-Verletzung 0         max 0.000e+0 px        (v2: 56.94 px)
   spawn-motor   Muskelziele = Spawn-Pose
   grip          verankerter Arm zieht    70.6 px = 72 %         (v2: 92…99 %)
@@ -246,7 +248,33 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
    Struct-Feldanzahl gegen Byte-Stride, Params-Größe gegen Buffer, alle 5
    Entry-Points verdrahtet, 6 Bindings mit korrektem `read-only-storage` vs.
    `storage`, Workgroup-Größe identisch, Substep-Reihenfolge wie im Oracle, und
-   alle Solver-Konstanten werden aus dem CPU-World *gelesen* statt dupliziert.
+   alle Solver-Konstanten werden aus dem CPU-World *gelesen* statt dupliziert
+   — einschließlich der Totzone (`SLACK_POS`/`SLACK_ANG`, Werte UND Verwendung
+   auf beiden Seiten).
+
+   **Messstand Browser-Validierung** (RTX 3070 Ti, Build `d487532`): **10/11**.
+   Sequenzieller Farb-Dispatch hatte G3 (Zugweg 70.33 CPU vs 70.36 GPU),
+   G5 (Determinismus, identische Hashes) und G1-maxV geheilt. Die zwei
+   verbleibenden Befunde, beide seitdem behoben:
+
+   - **G1 Wachstum 1.2789 px** — kein Race, sondern die numerische Bodenhöhe
+     von f32: ulp(position) ≈ 1.7e-4 px bei 1440-px-Koordinaten (G2 maß die
+     Spawn-Verletzung nach Upload: 2.0e-4 px — exakt diese Größenordnung).
+     Das Rundungszittern wurde über `v = Δp/h` zu 0.1606 px/s Rausch-
+     geschwindigkeit und integrierte sich linear. Heilung: **Korrektur-
+     Totzone** `SLACK_POS = 2e-3 px`, `SLACK_ANG = 2e-4 rad` in BEIDEN
+     Solvern — Ruhezustände sind damit bitexakte Fixpunkte (Harness-Checks
+     `slack-fixpoint`: Δ = 0.00e+0; `slack-corrects`: 0.050 px → 1.95e-3 px,
+     echte Verletzungen werden weiterhin korrigiert; grip-pull unverändert
+     70.6 px, Lern-Checks unverändert grün).
+   - **G4 war falsch-positiv** — der Test setzte die Vollast-Motoren auf
+     `a.krakens` (CPU-Welt), aber `uploadControls(gpu)` liest die Welt des
+     GPU-Handles (`b.world`). Die GPU simulierte ein passives Tier: maxV
+     0.1415 px/s ≈ G1-Rauschboden 0.1606 statt 360 am Limit. Behoben:
+     Steuerung geht in beide Welten, und das Urteil verlangt jetzt
+     ≥ 80 % des CPU-Spitzenwerts — „nur unter Limit" besteht sonst auch
+     im Stillstand. G5 lädt die Steuerung seitdem ebenfalls hoch
+     (Determinismus unter Muskellast, nicht nur im Ruhezustand).
 4. **Gegner.** Bewohner-Agent im Trainings-Loop mit Lärm, Duftspur und Angriff.
    In v2 war die komplette gegenseitige Wahrnehmung gebaut, stand aber unter
    keinem Selektionsdruck: `stepPhysics` hatte null Referenzen auf den Spieler.
@@ -254,7 +282,7 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
 ## Lokal
 
 ```bash
-node tools/harness.js          # 47 Abnahme-Checks
+node tools/harness.js          # 49 Abnahme-Checks
 node tools/check-wgsl.js       # Shader/Binding-Konsistenz (ohne GPU)
 node tools/trainrun.js --gens 20 --pop 32   # echter Trainingslauf (~90 s)
 python3 -m http.server 8080    # oder: npx serve .   → http://localhost:8080

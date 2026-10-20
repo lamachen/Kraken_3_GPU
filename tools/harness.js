@@ -12,7 +12,7 @@
  *   node tools/harness.js
  *   node tools/harness.js --only passive,grip
  */
-import { XpbdWorld } from '../src/physics/xpbd.js';
+import { XpbdWorld, SLACK_POS, SLACK_ANG } from '../src/physics/xpbd.js';
 import { makeMap, findSpawn, mulberry32, coverageAt } from '../src/world/map.js';
 import {
   spawnKraken, tipPosition, attachGrip, releaseGrip, armCurl, armExtension,
@@ -54,6 +54,64 @@ if (want('passive')) {
   check('passive', 'Passiv exakt in Ruhe (8 s, kein Antrieb)',
     c.pathLen < 1e-9 && disp < 1e-9 && sim.world.stats.nan === 0,
     `Pfad=${c.pathLen.toExponential(2)}px  Verschiebung=${disp.toExponential(2)}px  max|ω|=${sim.world.stats.maxAngSpeed.toExponential(2)}  (v2: 964 px)`);
+}
+
+// ══════════════════════════════════════════════════════════════
+section('CHECK 1b — KORREKTUR-TOTZONE (f32-Boden der GPU, G1-Drift 1.2789 px)');
+if (want('slack')) {
+  // Der WGSL-Solver rechnet Float32: bei ~1440 px Koordinaten ist ulp(position)
+  // ≈ 1.7e-4 px, das Spawn-Gleichgewicht ist dort kein exakter Fixpunkt.
+  // Gemessen an Build d487532 auf einer RTX 3070 Ti: G2 Spawn-Verletzung
+  // 2.0e-4 px, G1 Rausch-maxV 0.1606 px/s, G1 Drift-Wachstum 1.2789 px nach
+  // 2400 Schritten (CPU-Oracle: 3.4e-9). SLACK_POS/SLACK_ANG überspringen
+  // Korrekturen im Rundungsband — in BEIDEN Solvern (Parität prüft
+  // check-wgsl.js). Diese beiden Checks pinnen die Totzone von beiden Seiten:
+  // (a) Störung innerhalb des Bands darf keinerlei Dynamik erzeugen,
+  // (b) eine echte Verletzung (25× slack) muss weiterhin herauskorrigiert
+  //     werden — die Totzone darf nicht „zu groß" konfiguriert sein.
+  const violPins = (w) => {
+    let worst = 0;
+    for (const c of w.constraints) {
+      if (c.type !== 0 || c.broken) continue;
+      const A = c.a, B = c.b;
+      const ca = Math.cos(w.ang[A]), sa = Math.sin(w.ang[A]);
+      const gax = w.px[A] + c.lax * ca - c.lay * sa, gay = w.py[A] + c.lax * sa + c.lay * ca;
+      let gbx, gby;
+      if (B >= 0) { const cb = Math.cos(w.ang[B]), sb = Math.sin(w.ang[B]); gbx = w.px[B] + c.lbx * cb - c.lby * sb; gby = w.py[B] + c.lbx * sb + c.lby * cb; }
+      else { gbx = c.lbx; gby = c.lby; }
+      worst = Math.max(worst, Math.hypot(gax - gbx, gay - gby));
+    }
+    return worst;
+  };
+  const map = makeMap(1440, 810, { seed: 5 });
+  const sp = findSpawn(map, ARM_REACH + 20, mulberry32(9));
+
+  // (a) Fixpunkt: Störung 0.4× SLACK_POS → kein Körper darf sich bewegen.
+  const w1 = new XpbdWorld(); w1.sdf = map.sdf;
+  const k1 = spawnKraken(w1, sp.x, sp.y, 0.4);
+  const b0 = k1.arms[0].segs[1];
+  w1.px[b0] += SLACK_POS * 0.4;
+  const px0 = Float64Array.from(w1.px), py0 = Float64Array.from(w1.py), ang0 = Float64Array.from(w1.ang);
+  for (let i = 0; i < 240; i++) w1.step();
+  let moved = 0;
+  for (let i = 0; i < w1.n; i++) {
+    moved = Math.max(moved, Math.hypot(w1.px[i] - px0[i], w1.py[i] - py0[i]), Math.abs(w1.ang[i] - ang0[i]));
+  }
+  check('slack-fixpoint', `Störung < slack (${(SLACK_POS * 0.4).toExponential(1)} px): Null Dynamik, v bleibt 0`,
+    moved === 0 && w1.stats.maxSpeed === 0 && w1.stats.maxAngSpeed === 0,
+    `max Δ nach 240 Schritten = ${moved.toExponential(2)}  max|v| = ${w1.stats.maxSpeed.toExponential(2)}  (GPU ohne Totzone: 1.28 px Drift aus genau diesem Zittern)`);
+
+  // (b) Echte Verletzung 25× slack (5e-2 px) → muss zurück in die Bandbreite.
+  const w2 = new XpbdWorld(); w2.sdf = map.sdf;
+  const k2 = spawnKraken(w2, sp.x, sp.y, 0.4);
+  const b1 = k2.arms[0].segs[1];
+  w2.px[b1] += 0.05;
+  const before = violPins(w2);
+  for (let i = 0; i < 240; i++) w2.step();
+  const after = violPins(w2);
+  check('slack-corrects', 'Verletzung 25× slack wird herauskorrigiert (Band < 0.01 px)',
+    before > 0.04 && after < 0.01,
+    `Pin-Verletzung ${before.toFixed(3)} px → ${after.toExponential(2)} px nach 240 Schritten (slack = ${SLACK_POS} px, ${SLACK_ANG} rad)`);
 }
 
 // ══════════════════════════════════════════════════════════════

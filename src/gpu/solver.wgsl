@@ -75,6 +75,19 @@ struct ColorU { c: u32, pad0: u32, pad1: u32, pad2: u32 };
 
 const TAU: f32 = 6.28318530718;
 
+// ── Korrektur-Totzone — PARITÄT zu SLACK_POS/SLACK_ANG in xpbd.js ──────────
+// (statisch geprüft von tools/check-wgsl.js). Grund: f32-Boden. Bei ~1440 px
+// Koordinaten ist ulp(position) ≈ 1.7e-4 px, das Spawn-Gleichgewicht ist in
+// f32 kein exakter Fixpunkt (G2 gemessen, Build d487532: 2.0e-4 px Verletzung
+// nach Upload). Ohne Totzone integrierte sich das Rundungszittern über
+// v = Δp/h zu Rauschgeschwindigkeit 0.1606 px/s und linearem Drift: G1
+// Wachstum 1.2789 px nach 2400 Schritten, CPU-Oracle 3.4e-9. Mit Totzone ist
+// jeder Ruhezustand bitexakt stationär: pPred = p + h·0 = p, alle |C| < slack
+// → keine Projektion → v bleibt 0. Echte Lasten liegen 1–2 Zehnerpotenzen
+// über dem Band (Muskelzug: ~0.01–1 px Verletzung pro Substep).
+const SLACK_POS: f32 = 0.002;    // px  — identisch zu SLACK_POS = 2e-3 (JS)
+const SLACK_ANG: f32 = 0.0002;   // rad — identisch zu SLACK_ANG = 2e-4 (JS)
+
 fn wrapAngle(a: f32) -> f32 {
   var d = a % TAU;
   if (d > 3.14159265359) { return d - TAU; }
@@ -231,6 +244,8 @@ fn solvePin(k: u32) {
   let Cx = gax - gbx;
   let Cy = gay - gby;
   if (!(Cx == Cx) || !(Cy == Cy)) { return; }
+  // Totzone (SLACK_POS) — Parität zu _solvePin in xpbd.js.
+  if (Cx * Cx + Cy * Cy < SLACK_POS * SLACK_POS) { return; }
 
   let pax = -ray; let pay = rax;      // perp(r)
   let pbx = -rby; let pby = rbx;
@@ -291,17 +306,20 @@ fn solveAngle(k: u32) {
   let C = angleDelta(dev, c.tgt);
   if (!(C == C)) { return; }
 
-  let alphaTilde = c.compliance * P.invH2;
-  let dl = -(C + alphaTilde * c.lam) / (wSum + alphaTilde);
-  if (!(dl == dl)) { return; }
-  c.lam = c.lam + dl;
-  if (hasB) {
-    var bb = bodies[c.bIdx];
-    bb.angP = bb.angP + wB * dl;
-    bodies[c.bIdx] = bb;
-    a.angP = a.angP - wA * dl;
-  } else {
-    a.angP = a.angP + wA * dl;
+  // Totzone (SLACK_ANG) — Parität zu _solveAngle in xpbd.js.
+  if (abs(C) >= SLACK_ANG) {
+    let alphaTilde = c.compliance * P.invH2;
+    let dl = -(C + alphaTilde * c.lam) / (wSum + alphaTilde);
+    if (!(dl == dl)) { return; }
+    c.lam = c.lam + dl;
+    if (hasB) {
+      var bb = bodies[c.bIdx];
+      bb.angP = bb.angP + wB * dl;
+      bodies[c.bIdx] = bb;
+      a.angP = a.angP - wA * dl;
+    } else {
+      a.angP = a.angP + wA * dl;
+    }
   }
 
   // Gelenkgrenze als einseitige harte Nebenbedingung
@@ -311,7 +329,7 @@ fn solveAngle(k: u32) {
   var over = 0.0;
   if (dev2 > c.maxAng) { over = dev2 - c.maxAng; }
   if (dev2 < c.minAng) { over = dev2 - c.minAng; }
-  if (over != 0.0) {
+  if (abs(over) >= SLACK_ANG) {
     let dl2 = -over / wSum;
     if (hasB) {
       var bb = bodies[c.bIdx];
@@ -339,8 +357,10 @@ fn solveCollisions(@builtin(global_invocation_id) gid: vec3u) {
   let wy = b.ppy + cp.lx * sa + cp.ly * ca;
   let hit = sdf(wx, wy);
   if (!hit.valid) { return; }
-  if (hit.d >= cp.r) { return; }
   let pen = cp.r - hit.d;
+  // Totzone — Parität zu _solveCollisions in xpbd.js: Kontakt-Rauschen unter
+  // dem f32-Boden überspringen, sonst zittert ein aufliegender Körper.
+  if (pen <= SLACK_POS) { return; }
   b.ppx = b.ppx + hit.nx * pen;
   b.ppy = b.ppy + hit.ny * pen;
   bodies[cp.body] = b;

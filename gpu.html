@@ -214,10 +214,14 @@ say('\n--- G1 passives Gleichgewicht ---');
     cpuPath += Math.hypot(a.world.px[m] - a.krakens[ci].spawn.x, a.world.py[m] - a.krakens[ci].spawn.y);
     gpuPath += Math.hypot(b.world.px[m2] - b.krakens[ci].spawn.x, b.world.py[m2] - b.krakens[ci].spawn.y);
   }
-  // CPU rechnet Float64, GPU Float32: ein driftfreies System ist auf f32 nicht
-  // bit-exakt null (Positionsrundung bei ~1000 px Koordinaten ~6e-5). Deshalb
-  // absolute Schwelle plus WACHSTUMStest über 9x die Zeit: echte Energie-
-  // injektion (Kraken_v2: 964 px!) wächst linear, ein Rundungsrest nicht.
+  // CPU rechnet Float64, GPU Float32. Seit der Korrektur-Totzone (SLACK_POS/
+  // SLACK_ANG in xpbd.js + solver.wgsl) sind Ruhezustände AUF BEIDEN Seiten
+  // bitexakte Fixpunkte: alle |C| < slack → keine Projektion → v = (p-p)/h = 0.
+  // Sollwert für beide Spalten ist damit 0.0000, nicht mehr „f32-Boden ~0.04".
+  // Ohne Totzone integrierte sich das f32-Rundungszittern hier linear auf
+  // (gemessen an d487532: 1.2789 px Wachstum, maxV 0.1606 px/s). Der Wachstums-
+  // test bleibt trotzdem das Tor gegen Energie-Injektion: Kraken_v2 lieferte
+  // 964 px, der tote Shader-Rest 1.28 px — beides wächst, ein Fixpunkt nicht.
   for (let i = 0; i < 2160; i++) { a.world.step(); }
   for (let i = 0; i < 2160; i++) { await step(gpu); }
   const gs2 = await download(gpu);
@@ -229,10 +233,10 @@ say('\n--- G1 passives Gleichgewicht ---');
   }
   const grew = gpuPath2 - gpuPath;
   const cpuGrew = cpuPath2 - cpuPath;
-  verdict('G1 passiv', 'Verschiebung ohne Antrieb, 240 Schritte (f32-Boden, Soll ≈0)', cpuPath, gpuPath, gpuPath < 0.05, '< 0.05 px');
-  verdict('G1 Wachstum', '+2160 Schritte: Drift wächst NICHT linear (Energie-Injektion?)', cpuGrew, grew, grew < 0.05, '< 0.05 px');
-  say('    (Kraken_v2 auf matter-js lieferte im selben Test 964 px — als Referenzmarke)');
-  verdict('G1 maxV', 'Spitzengeschwindigkeit (f32-Boden)', a.world.stats.maxSpeed, gs2.maxSpeed, gs2.maxSpeed < 0.5, '< 0.5 px/s');
+  verdict('G1 passiv', 'Verschiebung ohne Antrieb, 240 Schritte (Fixpunkt, Soll exakt 0)', cpuPath, gpuPath, gpuPath < 0.05, '< 0.05 px');
+  verdict('G1 Wachstum', '+2160 Schritte: Drift darf nicht wachsen (Soll exakt 0)', cpuGrew, grew, grew < 0.01, '< 0.01 px');
+  say('    (Ohne Totzone: 1.2789 px f32-Zitter-Drift — Kraken_v2 auf matter-js: 964 px Energie-Injektion)');
+  verdict('G1 maxV', 'Spitzengeschwindigkeit (Fixpunkt, Soll exakt 0)', a.world.stats.maxSpeed, gs2.maxSpeed, gs2.maxSpeed < 0.05, '< 0.05 px/s');
   verdict('G1 NaN', 'NaN-Körper', a.world.stats.nan, gs.nan, gs.nan === 0, false);
   destroy(gpu);
 }
@@ -317,7 +321,13 @@ say('\n--- G4 Grenzen unter Vollast ---');
   upload(gpu);
   let cpuPeakV = 0, cpuPeakA = 0, cpuNaN = 0, gpuPeakV = 0, gpuPeakA = 0, gpuNaN = 0;
   for (let i = 0; i < STEPS; i++) {
-    for (const k of a.krakens) for (let ai = 0; ai < k.arms.length; ai++) {
+    // Die Steuerung muss in BEIDE Welten: die CPU liest a.krakens, aber
+    // uploadControls(gpu) liest die Constraints der Welt, aus der das GPU-
+    // Handle erzeugt wurde — b.world. Die alte Version setzte nur a.krakens:
+    // die GPU bekam die unveränderten Spawn-Motoren und simulierte ein
+    // passives Tier. Gemessen an Build d487532: GPU maxV 0.1415 px/s ≈
+    // G1-Rauschboden 0.1606 statt 360 am Limit — das „OK" war falsch-positiv.
+    for (const k of a.krakens.concat(b.krakens)) for (let ai = 0; ai < k.arms.length; ai++) {
       const arm = k.arms[ai];
       for (const m of arm.motors) { m.compliance = toneToCompliance(0.9); m.target = Math.sin(i * 0.2 + ai) * BODY.jointLimit; }
     }
@@ -331,8 +341,13 @@ say('\n--- G4 Grenzen unter Vollast ---');
     gpuPeakV = Math.max(gpuPeakV, gs.maxSpeed); gpuPeakA = Math.max(gpuPeakA, gs.maxAngSpeed); gpuNaN += gs.nan;
   }
   verdict('G4 NaN', 'NaN-Ereignisse über ' + STEPS + ' Schritte × ' + N + ' Tiere', cpuNaN, gpuNaN, gpuNaN === 0, false);
-  verdict('G4 maxV', 'Spitzengeschwindigkeit (Limit 360 px/s)', cpuPeakV, gpuPeakV, gpuPeakV <= 360.5, 'Limit');
-  verdict('G4 maxω', 'Spitzen-Winkelgeschwindigkeit (Limit 18 rad/s)', cpuPeakA, gpuPeakA, gpuPeakA <= 18.05, 'Limit');
+  // Nicht nur „≤ Limit": die GPU muss unter derselben Vollast auch WIRKLICH
+  // angetrieben werden (≥ 80 % des CPU-Spitzenwerts). Sonst besteht der Check
+  // auch, wenn die Steuerung nie ankommt — genau der alte Fehler.
+  verdict('G4 maxV', 'Spitzengeschwindigkeit unter Vollast (Limit 360 px/s)', cpuPeakV, gpuPeakV,
+    gpuPeakV <= 360.5 && gpuPeakV >= 0.8 * cpuPeakV, 'Limit + ≥ 80 % des CPU-Peaks');
+  verdict('G4 maxω', 'Spitzen-Winkelgeschwindigkeit unter Vollast (Limit 18 rad/s)', cpuPeakA, gpuPeakA,
+    gpuPeakA <= 18.05 && gpuPeakA >= 0.8 * cpuPeakA, 'Limit + ≥ 80 % des CPU-Peaks');
   destroy(gpu);
 }
 
@@ -344,6 +359,10 @@ say('\n--- G5 GPU-Determinismus ---');
     const gpu = await create(s.world, s.map, wgsl, device);
     upload(gpu);
     for (const k of s.krakens) for (const arm of k.arms) for (const m of arm.motors) { m.compliance = toneToCompliance(0.8); m.target = 0.5; }
+    // Steuerung NACH dem Setzen hochladen — sonst wird Determinismus nur im
+    // Passivbetrieb getestet (Spawn-Motoren) und ein Race unter Muskellast
+    // bliebe unsichtbar. Der Sammel-Dispatch-Race (d487532) fiel genau hier auf.
+    uploadControls(gpu);
     for (let i = 0; i < 300; i++) { await step(gpu); }
     await download(gpu);
     let h = 0;

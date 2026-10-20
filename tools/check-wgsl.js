@@ -197,6 +197,28 @@ console.log('\n── CPU-Oracle-Parität: dieselben Konstanten ──');
     if (js.includes('cpu.' + k)) good(`${k} wird aus dem CPU-World gelesen, nicht dupliziert`);
     else bad(`${k} wird nicht vom CPU-World übernommen — Gefahr von Drift`);
   }
+
+  // Totzone (SLACK_POS/SLACK_ANG): Werte UND Verwendung müssen auf beiden
+  // Seiten identisch sein. Driften sie auseinander, „korrigiert" nur eine
+  // Seite den f32-Boden (G1-Drift 1.2789 px, gemessen an Build d487532) oder
+  // schluckt echte Verletzungen — beides wäre im Oracle-Vergleich unsichtbar,
+  // wenn die Konstanten nicht statisch gepinnt sind.
+  for (const name of ['SLACK_POS', 'SLACK_ANG']) {
+    const mJs = cpu.match(new RegExp('export const ' + name + ' = ([0-9.eE+-]+);'));
+    const mWg = wg.match(new RegExp('const ' + name + ': f32 = ([0-9.eE+-]+);'));
+    if (!mJs || !mWg) { bad(`${name} fehlt (xpbd.js: ${!!mJs}, solver.wgsl: ${!!mWg})`); continue; }
+    if (Number(mJs[1]) !== Number(mWg[1])) bad(`${name}: CPU ${mJs[1]} ≠ GPU ${mWg[1]}`);
+    else good(`${name} = ${Number(mJs[1])} — Parität xpbd.js ↔ solver.wgsl`);
+  }
+  const deadzoneUses = [
+    ['xpbd.js', cpu, ['SLACK_POS * SLACK_POS', 'Math.abs(C) >= SLACK_ANG', 'Math.abs(over) >= SLACK_ANG', 'pen <= SLACK_POS']],
+    ['solver.wgsl', wg, ['SLACK_POS * SLACK_POS', 'abs(C) >= SLACK_ANG', 'abs(over) >= SLACK_ANG', 'pen <= SLACK_POS']],
+  ];
+  for (const [label, src, needles] of deadzoneUses) {
+    const miss = needles.filter(nd => !src.includes(nd));
+    if (miss.length) bad(`Totzone in ${label} unvollständig: fehlt ${miss.join(', ')}`);
+    else good(`${label}: Totzone in Pin, Muskel, Gelenkgrenze und Kollision aktiv`);
+  }
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${fail} Problem(e)`);
