@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8"><title>WebGPU-Minimaltest</title>
+<style>body{background:#000409;color:#3affa8;font:13px/1.7 'Share Tech Mono',ui-monospace,Consolas,monospace;padding:24px;max-width:860px}
+b{color:#00ffb3;font-weight:400}.bad{color:#ff3a6e}.ok{color:#00ffb3}.dim{color:#0f68}
+button{background:rgba(0,12,8,.85);border:1px solid #0f35;color:#0f8;padding:8px 16px;cursor:pointer;font:inherit;margin:6px 6px 6px 0}
+pre{background:rgba(0,12,8,.6);border:1px solid #0f32;padding:10px;white-space:pre-wrap}</style>
+</head>
+<body>
+<h2 style="letter-spacing:2px">WEBGPU-MINIMALTEST</h2>
+<p class="dim">Keine Module, keine Simulation, keine Dependencies. Eine einzige
+<code>requestAdapter()</code>-Anfrage. Wenn DAS hier fehlschlägt, liegt es nicht an
+Kraken_3_GPU, sondern am Browser-/Treiberzustand.</p>
+<button onclick="probe()">Erneut prüfen</button>
+<button onclick="probe({forceFallbackAdapter:true})">Nur Fallback-Adapter</button>
+<pre id="out">…</pre>
+<script>
+const out = document.getElementById('out');
+const line = (s) => { out.textContent += s + '\n'; };
+async function probe(opts) {
+  out.textContent = '';
+  line('navigator.gpu            : ' + (navigator.gpu ? 'vorhanden' : 'FEHLT'));
+  line('secure context           : ' + (window.isSecureContext ? 'ja' : 'NEIN'));
+  line('userAgent                : ' + navigator.userAgent);
+  line('deviceMemory / cores     : ' + (navigator.deviceMemory||'?') + ' / ' + (navigator.hardwareConcurrency||'?'));
+  line('');
+  const t0 = performance.now();
+  let a = null, err = null;
+  try { a = await navigator.gpu.requestAdapter(opts); }
+  catch (e) { err = e; }
+  const ms = (performance.now() - t0).toFixed(1);
+  line('requestAdapter(' + JSON.stringify(opts||null) + ')  →  ' +
+       (err ? 'GEWORFEN: ' + err.message : (a ? 'Adapter in ' + ms + ' ms' : 'null in ' + ms + ' ms')));
+  if (a) {
+    line('  isFallbackAdapter    : ' + a.isFallbackAdapter);
+    line('  features             : ' + a.features.size + ' Einträge');
+    line('  limits.maxBufferSize : ' + a.limits.maxBufferSize);
+    let info = null;
+    try { info = await a.requestAdapterInfo ? await a.requestAdapterInfo() : (a.info||null); } catch(e){}
+    if (info) line('  info                 : ' + JSON.stringify(info));
+    else if (a.info) line('  info                 : ' + JSON.stringify(a.info));
+    out.className = 'ok';
+    line('\n✅ WebGPU-Adapter verfügbar. gpu.html sollte nach Browser-Neustart laufen.');
+  } else {
+    out.className = 'bad';
+    line('\n❌ Kein Adapter. Prüfreihenfolge:');
+    line(' 1. Task-Manager (Strg+Shift+Esc): ALLE chrome.exe-Prozesse beenden.');
+    line('    Chrome läuft auf Windows im Hintergrund weiter — "Fenster schließen"');
+    line('    beendet den GPU-Prozess NICHT. Das ist der häufigste Grund, warum ein');
+    line('    Neustart nichts ändert.');
+    line('    Alternativ: chrome://settings/system → "Background-Apps" AUS.');
+    line(' 2. Windows: Einstellungen → System → Bildschirm → Grafik → chrome.exe');
+    line('    hinzufügen → "Hohe Leistung" (erzwingt die dedizierte GPU).');
+    line(' 3. chrome://gpu öffnen → Zeile "WebGPU" suchen: Disabled / Software only?');
+    line(' 4. NVIDIA-Treiber aktualisieren; Energiesparmodus testweise aus.');
+    line(' 5. Inkognito ohne Extensions probieren (Extensions können Devices killen).');
+  }
+}
+probe();
+</script>
+</body>
+</html>
