@@ -139,6 +139,47 @@ console.log('\n── Reservierte WGSL-Schlüsselwörter als Bezeichner ──')
   else bad('reservierte WGSL-Schlüsselwörter: ' + offenders.join(', '));
 }
 
+console.log('\n── Typkorrektheit der Buffer-Schreibweise (DEVICE_HUNG-Regression) ──');
+{
+  // Gemessen am 19.10.2026 auf einer RTX 3070 Ti: Ganzzahlen, die über ein
+  // Float32Array in u32/i32-Shaderfelder geschrieben werden, landen dort als
+  // Float-BITMUSTER. iterations=4 wurde zu i32 1.082.130.432, nRects zu einer
+  // Milliarden-Zahl — die SDF-Schleife lief praktisch endlos, die GPU hing,
+  // Windows setzte sie per TDR zurück (DXGI_ERROR_DEVICE_HUNG 0x887A0006),
+  // und danach lieferte requestAdapter() bis zum Browser-Neustart null.
+  //
+  // Dieser Check pinnt die korrekte Schreibweise fest.
+  const BAD = [
+    /g\.params\[\s*\d+\s*\]\s*=\s*cpu\.(iterations|n)\b/,
+    /g\.params\[\s*\d+\s*\]\s*=\s*(cpu\.)?(constraints|collPts)\.length/,
+    /consData\[o\s*\+?\s*0?\]\s*=\s*c\.a\b/,
+    /consData\[o\s*\+\s*1\]\s*=\s*c\.b\b/,
+    /consData\[o\s*\+\s*2\]\s*=\s*c\.type/,
+    /consData\[o\s*\+\s*17\]\s*=\s*c\.broken/,
+    /collData\[o\]\s*=\s*p\.body/,
+  ];
+  let bad = 0;
+  for (const re of BAD) if (re.test(js)) { bad++; console.log('    ❌ altes Muster vorhanden: ' + re); }
+  const GOOD = [
+    ['I[1] = cpu.iterations', 'iterations über Int32-Sicht'],
+    ['U[6] = cpu.n', 'nBodies über Uint32-Sicht'],
+    ['U[9] = map.rects.length', 'nRects über Uint32-Sicht'],
+    ['consU[o] = c.a', 'Constraint-Body-Indizes über Uint32-Sicht'],
+    ['consU[o + 17] = c.broken', 'broken-Flag über Uint32-Sicht'],
+    ['collU[o] = p.body', 'CollPt-Body-Index über Uint32-Sicht'],
+  ];
+  for (const [needle, label] of GOOD) {
+    if (js.includes(needle)) good(label);
+    else { bad++; console.log('    ❌ fehlt: ' + label + '  (' + needle + ')'); }
+  }
+  if (bad === 0) good('keine Ganzzahl wird über eine Float-Sicht in ein u32/i32-Feld geschrieben');
+  else { fail += bad; console.log('    ❌ ' + bad + ' typinkorrekte Schreibweise(n)'); }
+  for (const needle of ['iterations unplausibel', 'nRects unplausibel', 'nBodies unplausibel']) {
+    if (js.includes(needle)) good('Sanity-Guard: ' + needle);
+    else { fail++; console.log('    ❌ Guard fehlt: ' + needle); }
+  }
+}
+
 console.log('\n── Reihenfolge der Substeps (Shader-Aufrufe in gpuworld.js) ──');
 {
   const order = [...js.matchAll(/pipelines\.(\w+)/g)].map(m => m[1]);
