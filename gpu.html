@@ -32,6 +32,7 @@ button:hover{border-color:#0f8;background:rgba(0,255,128,.1)}
 <body>
 <h1>GPU-VALIDIERUNG</h1>
 <div class="sub">
+  Build <b id="stamp" style="color:#ffdd00">…</b> ·
   WebGPU-XPBD gegen das CPU-Oracle (<code>src/physics/xpbd.js</code>), auf identischen Eingaben,
   im selben Browser, zur selben Zeit. <a href="./">← zurück zur Simulation</a>
 </div>
@@ -71,6 +72,7 @@ const envRow = (k, v, cls) => {
   tr.innerHTML = `<td class="dim">${k}</td><td class="${cls || ''}">${v}</td>`;
   $('env').appendChild(tr);
 };
+document.addEventListener('DOMContentLoaded', () => {});
 const BUILD_SHA = '57da2d4';
 let pass = 0, fail = 0;
 const gpuHash = (w) => { let h = 0; for (let i = 0; i < w.n; i++) { h = (h * 31 + Math.round(w.px[i] * 1e4)) | 0; h = (h * 31 + Math.round(w.py[i] * 1e4)) | 0; } return h; };
@@ -105,6 +107,7 @@ function fatal(msg) {
 // jede Verwechslung einen kompletten Diagnose-Durchlauf (passiert: 2716c10
 // statt 57da2d4, Crash an einer Zeile, die es im neuen Build nicht mehr gab).
 envRow('Build', BUILD_SHA, 'dim');
+  const st = document.getElementById('stamp'); if (st) st.textContent = BUILD_SHA;
 envRow('WebGPU-API (navigator.gpu)', isAvailable() ? 'vorhanden — sagt NICHTS über einen nutzbaren Adapter' : 'FEHLT', isAvailable() ? 'ok' : 'bad');
 envRow('User Agent', navigator.userAgent.slice(0, 90), 'dim');
 if (!isAvailable()) {
@@ -227,7 +230,7 @@ say('\n--- G1 passives Gleichgewicht ---');
   const grew = gpuPath2 - gpuPath;
   const cpuGrew = cpuPath2 - cpuPath;
   verdict('G1 passiv', 'Verschiebung ohne Antrieb, 240 Schritte (f32-Boden, Soll ≈0)', cpuPath, gpuPath, gpuPath < 0.05, '< 0.05 px');
-  verdict('G1 Wachstum', '+2160 Schritte: Drift wächst NICHT linear (Energie-Injektion?)', grew, grew, grew < 0.05, '< 0.05 px');
+  verdict('G1 Wachstum', '+2160 Schritte: Drift wächst NICHT linear (Energie-Injektion?)', cpuGrew, grew, grew < 0.05, '< 0.05 px');
   say('    (Kraken_v2 auf matter-js lieferte im selben Test 964 px — als Referenzmarke)');
   verdict('G1 maxV', 'Spitzengeschwindigkeit (f32-Boden)', a.world.stats.maxSpeed, gs2.maxSpeed, gs2.maxSpeed < 0.5, '< 0.5 px/s');
   verdict('G1 NaN', 'NaN-Körper', a.world.stats.nan, gs.nan, gs.nan === 0, false);
@@ -240,6 +243,11 @@ say('\n--- G2 Spawn-Verletzung ---');
   const a = buildWorld(8, 23);
   const b = buildWorld(8, 23);
   const gpu = await create(b.world, b.map, wgsl, device);
+  // upload() ist PFLICHT vor step(): seit es Farbgruppen gibt, wird colorWG
+  // (Workgroups pro Farbe) erst dort gesetzt. Ohne upload war der Dispatch-
+  // Ausdruck 16*undefined = NaN und dispatchWorkgroups() warf
+  // "Value is not of type 'unsigned long'" (von dir gemessen, Zeile 278).
+  upload(gpu);
   const viol = (w) => {
     let worst = 0;
     for (const c of w.constraints) {
