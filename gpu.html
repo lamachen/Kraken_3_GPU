@@ -71,6 +71,7 @@ const envRow = (k, v, cls) => {
   tr.innerHTML = `<td class="dim">${k}</td><td class="${cls || ''}">${v}</td>`;
   $('env').appendChild(tr);
 };
+const BUILD_SHA = '57da2d4';
 let pass = 0, fail = 0;
 const gpuHash = (w) => { let h = 0; for (let i = 0; i < w.n; i++) { h = (h * 31 + Math.round(w.px[i] * 1e4)) | 0; h = (h * 31 + Math.round(w.py[i] * 1e4)) | 0; } return h; };
 function verdict(name, what, cpuVal, gpuVal, ok, tol) {
@@ -99,6 +100,11 @@ function fatal(msg) {
 //   requestAdapter() != null = der Treiber gibt einen nutzbaren Adapter her
 // Die alte Zeile hieß "WebGPU verfügbar: ja" und suggerierte Hardware, wo nur
 // eine API-Schnittstelle geprüft wurde. Genau das hat zu Recht verwirrt.
+// Build-Stempel: macht eine gecachte Altversion SOFORT sichtbar. Module und
+// Shader werden von Pages mit Cache-Control ausgeliefert; ohne Stempel kostet
+// jede Verwechslung einen kompletten Diagnose-Durchlauf (passiert: 2716c10
+// statt 57da2d4, Crash an einer Zeile, die es im neuen Build nicht mehr gab).
+envRow('Build', BUILD_SHA, 'dim');
 envRow('WebGPU-API (navigator.gpu)', isAvailable() ? 'vorhanden — sagt NICHTS über einen nutzbaren Adapter' : 'FEHLT', isAvailable() ? 'ok' : 'bad');
 envRow('User Agent', navigator.userAgent.slice(0, 90), 'dim');
 if (!isAvailable()) {
