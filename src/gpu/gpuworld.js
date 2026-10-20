@@ -99,6 +99,7 @@ export async function create(cpu, map, wgslSource, device) {
       { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
     ],
   });
   const pipelineLayout = device.createBindGroupLayout ? device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }) : null;
@@ -111,21 +112,33 @@ export async function create(cpu, map, wgslSource, device) {
     finalize: mk('finalize'),
     gripBreak: mk('gripBreak'),
   };
-  const bindGroup = device.createBindGroup({
-    layout: bindGroupLayout,
-    entries: [
-      { binding: 0, resource: { buffer: buffers.params } },
-      { binding: 1, resource: { buffer: buffers.bodies } },
-      { binding: 2, resource: { buffer: buffers.cons } },
-      { binding: 3, resource: { buffer: buffers.collPts } },
-      { binding: 4, resource: { buffer: buffers.rects } },
-      { binding: 5, resource: { buffer: buffers.forces } },
-      { binding: 6, resource: { buffer: buffers.colorInfo } },
-    ],
-  });
+  // 16 Color-Uniforms (einmalig) und 16 Bind-Groups, die sich alles teilen
+  // und nur in Binding 7 differieren. Sequentieller Farb-Dispatch ohne
+  // jegliche CPU-Kosten pro Schritt.
+  const colorUniforms = [];
+  const bindGroups = [];
+  for (let c = 0; c < 16; c++) {
+    const ub = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(ub, 0, new Uint32Array([c, 0, 0, 0]));
+    colorUniforms.push(ub);
+    bindGroups.push(device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: buffers.params } },
+        { binding: 1, resource: { buffer: buffers.bodies } },
+        { binding: 2, resource: { buffer: buffers.cons } },
+        { binding: 3, resource: { buffer: buffers.collPts } },
+        { binding: 4, resource: { buffer: buffers.rects } },
+        { binding: 5, resource: { buffer: buffers.forces } },
+        { binding: 6, resource: { buffer: buffers.colorInfo } },
+        { binding: 7, resource: { buffer: ub } },
+      ],
+    }));
+  }
+  const bindGroup = bindGroups[0];
 
   const g = {
-    device, buffers, pipelines, bindGroup, warnings,
+    device, buffers, pipelines, bindGroup, bindGroups, colorUniforms, warnings,
     cpu, map, nB, nC, nP, nR,
     // ALLE Felder sind 4 Byte, daher ist der Element-Index für Float32-,
     // Int32- und Uint32-Sicht derselbe. Ganzzahlen MÜSSEN über die Int-Sicht
@@ -275,10 +288,14 @@ export function substep(g) {
   p.dispatchWorkgroups(disp(g.nB)); p.end();
   for (let it = 0; it < g.cpu.iterations; it++) {
     p = pass();
-    p.setPipeline(g.pipelines.solveConstraints); p.setBindGroup(0, g.bindGroup);
-    // 16 Farben × Workgroups pro Farbe; Threads außerhalb einer Farbgruppe
-    // kehren sofort zurück (siehe solveConstraints).
-    p.dispatchWorkgroups(16 * g.colorWG);
+    p.setPipeline(g.pipelines.solveConstraints);
+    // Sequentiell pro Farbe: nur so ist die Färbung race-frei.
+    for (let c = 0; c < 16; c++) {
+      const cnt = g.cpu.colorCnt[c];
+      if (!cnt) continue;
+      p.setBindGroup(0, g.bindGroups[c]);
+      p.dispatchWorkgroups(Math.ceil(cnt / WORKGROUP));
+    }
     p.setPipeline(g.pipelines.solveCollisions); p.setBindGroup(0, g.bindGroup);
     p.dispatchWorkgroups(disp(g.nP));
     p.end();

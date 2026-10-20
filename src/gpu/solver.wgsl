@@ -66,6 +66,12 @@ struct Rect  { x: f32, y: f32, w: f32, h: f32 };
 // Innerhalb einer Farbe teilt kein Körper zwei Constraints, also kein
 // Schreib-Race ohne Atomics. Kein pro-Dispatch-Uniform-Update nötig.
 @group(0) @binding(6) var<storage, read> colorInfo: array<u32>;
+// Aktuelle Farbe dieses Dispatches. Es gibt 16 Bind-Groups (eine pro Farbe),
+// die sich ALLE Buffer teilen und sich nur in diesem 4-Byte-Uniform
+// unterscheiden. Dadurch kostet der sequentielle Farb-Dispatch nichts pro
+// Schritt: keine writeBuffer-Aufrufe, keine Synchronisation.
+struct ColorU { c: u32, pad0: u32, pad1: u32, pad2: u32 };
+@group(0) @binding(7) var<uniform> UC: ColorU;
 
 const TAU: f32 = 6.28318530718;
 
@@ -183,12 +189,15 @@ fn integrate(@builtin(global_invocation_id) gid: vec3u) {
 // ══ 2a. Constraints (Pin / Winkel / Grip) ═════════════════════════
 @compute @workgroup_size(64)
 fn solveConstraints(@builtin(global_invocation_id) gid: vec3u) {
-  let threadsPerColor = colorInfo[32] * 64u;
-  let color = gid.x / threadsPerColor;
-  let local = gid.x % threadsPerColor;
-  if (color >= 16u) { return; }
-  if (local >= colorInfo[16 + color]) { return; }
-  let k = colorInfo[color] + local;
+  // EIN Dispatch pro Farbe, sequentiell. Farben MÜSSEN sequentiell laufen:
+  // innerhalb einer Farbe teilt kein Körper zwei Constraints (race-frei),
+  // aber Constraints VERSCHIEDENER Farben teilen Körper sehr wohl. Ein
+  // Sammel-Dispatch über alle Farben (früherer Stand) lief deshalb trotz
+  // Färbung parallel auf gemeinsame Körper — gemessen: G5 nondeterministisch,
+  // G3-Grip bricht grundlos, G1 explodiert nach ~240 Schritten ans Limit.
+  let color = UC.c;
+  if (gid.x >= colorInfo[16 + color]) { return; }
+  let k = colorInfo[color] + gid.x;
   var c = cons[k];
   if (c.broken != 0u) { return; }
   if (c.cType == 1u) { solveAngle(k); return; }
