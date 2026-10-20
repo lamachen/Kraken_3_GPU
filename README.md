@@ -120,7 +120,7 @@ voll gestellt   (900 N Grenze)  → hält unter demselben Zug
 ## Abnahme: `node tools/harness.js`
 
 ```
-36/36 Checks bestanden
+47/47 Checks bestanden
   passiv        exakt in Ruhe            Pfad 0.00e+0 px        (v2: 964 px)
   spawn         Pin-Verletzung 0         max 0.000e+0 px        (v2: 56.94 px)
   spawn-motor   Muskelziele = Spawn-Pose
@@ -202,9 +202,51 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
    (Beute) als Duft- und Geräuschquellen. Eingang 42 → **85 Dimensionen**.
    Im Spiel bleibt das Wellenfeld mit gegenseitigem Hören — dieselbe
    Sensor-Schnittstelle (`write(out, offset)`), zwei Implementierungen.
-3. **Gehirn + Evolution + GPU.** WGSL-Portierung des Solvers gegen das Oracle
-   getestet, NN als batched Matmul, Natural Evolution Strategies (nicht CMA-ES:
-   bei 5307 Dimensionen wäre die Kovarianzmatrix 112 MB plus Eigenzerlegung).
+3. **[fertig: 3a] Gehirn + Evolution.** MLP 105→24→24→20 mit Rückkopplung der
+   eigenen Ausgaben (ohne Gedächtnis kein Rhythmus — die handgeschriebene
+   Gangkurve ist bewusst entfernt). Natural Evolution Strategies mit gespiegelten
+   Perturbationen, nicht CMA-ES (bei 3644 Gewichten wäre die Kovarianzmatrix
+   53 MB plus Eigenzerlegung pro Generation). Fitness nach den drei v2-Regeln:
+   nur Netto-Fortschritt, lageunabhängig, jeder Term einzeln nicht farmbar.
+
+   **Gemessener Trainingslauf** (32 Tiere, 500 Schritte/Gen, 20 Generationen, 91 s):
+
+   | | Start | Ende | Trend/Gen |
+   |---|---|---|---|
+   | Anker-Rate | 37 % | **100 %** | +1.42 % |
+   | Zug-Strecke | 9.3 px | **22.9 px** | +146 % |
+   | Netto-Distanz | 12.8 px | **22.1 px** | +73 % |
+   | Score | 224 | 294 | +2.96 |
+
+   3459 Kraken-Schritte/s, 4.5 s pro Generation. **Das erste Verhalten in diesem
+   Projekt, das nachweislich gelernt wurde** — in Kraken_v2 kam die Anker-Rate
+   über 12 % nie hinaus.
+
+   Bekannte Grenze: `Zugzyklen ≈ 1`. Die ES findet sofort „einmal festhalten und
+   nie mehr loslassen"; höhere `gait`-Gewichte ändern das nicht. Der Grund ist
+   dynamisch: Loslassen erfordert Adhäsion < 0.04 auf allen sechs Armen
+   gleichzeitig, und danach müssen die Spitzen für den Re-Grip unter 150 px/s
+   liegen — während der Körper gerade driftet.
+4. **[fertig: 3b, Validierung im Browser offen] GPU-Portierung.**
+   `src/gpu/solver.wgsl` ist ein 1:1-Port des CPU-Lösers (integrieren →
+   Constraint-Iterationen → Kollision → Abschluss → Grip-Bruch), `src/gpu/gpuworld.js`
+   die Bindings. **`gpu.html` fährt CPU und GPU auf identischen Eingaben im
+   selben Browser und vergleicht sie.**
+
+   Bit-Identität ist dabei *kein* gültiges Kriterium und wird nicht behauptet:
+   die CPU löst sequentiell (Gauss-Seidel), die GPU parallel ohne Atomics
+   (Jacobi). Bei mehreren Constraints am selben Körper ist das Ergebnis
+   reihenfolgeabhängig. Validiert wird deshalb getrennt:
+
+   - **EXAKT** — passives Gleichgewicht (Soll: 0.0), Spawn-Verletzung (Soll: 0),
+     NaN-Freiheit, GPU-Determinismus, Grip-Bruch-Status
+   - **TOLERANZ ±30 %** — grip-pull-Weg, Spitzenwerte innerhalb der Limits
+
+   Statisch ohne GPU prüfbar (`tools/check-wgsl.js`, Check 12 im Harness):
+   Struct-Feldanzahl gegen Byte-Stride, Params-Größe gegen Buffer, alle 5
+   Entry-Points verdrahtet, 6 Bindings mit korrektem `read-only-storage` vs.
+   `storage`, Workgroup-Größe identisch, Substep-Reihenfolge wie im Oracle, und
+   alle Solver-Konstanten werden aus dem CPU-World *gelesen* statt dupliziert.
 4. **Gegner.** Bewohner-Agent im Trainings-Loop mit Lärm, Duftspur und Angriff.
    In v2 war die komplette gegenseitige Wahrnehmung gebaut, stand aber unter
    keinem Selektionsdruck: `stepPhysics` hatte null Referenzen auf den Spieler.
@@ -212,7 +254,9 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
 ## Lokal
 
 ```bash
-node tools/harness.js          # 22 Abnahme-Checks
+node tools/harness.js          # 47 Abnahme-Checks
+node tools/check-wgsl.js       # Shader/Binding-Konsistenz (ohne GPU)
+node tools/trainrun.js --gens 20 --pop 32   # echter Trainingslauf (~90 s)
 python3 -m http.server 8080    # oder: npx serve .   → http://localhost:8080
 ```
 

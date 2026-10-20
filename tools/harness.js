@@ -608,6 +608,24 @@ if (want('map')) {
 }
 
 // ══════════════════════════════════════════════════════════════
+section('CHECK 12 — WGSL/Binding-Konsistenz (statisch, ohne GPU)');
+if (want('wgsl')) {
+  const { execFileSync } = await import('node:child_process');
+  try {
+    const out = execFileSync('node', [join(ROOT, 'tools/check-wgsl.js')], { encoding: 'utf8' });
+    const fails = (out.match(/❌/g) || []).length;
+    check('wgsl-static', 'Shader-Structs, Bindings und Entry-Points konsistent zu gpuworld.js', fails === 0,
+      fails === 0 ? 'Strides, 6 Bindings, 5 Entry-Points, Workgroup 64, Substep-Reihenfolge, Konstanten-Parität' : fails + ' Inkonsistenz(en)');
+  } catch (e) {
+    check('wgsl-static', 'Shader-Structs, Bindings und Entry-Points konsistent', false, (e.stdout || e.message).split('\n').filter(l => l.includes('❌')).join(' | '));
+  }
+  // Shader-Datei muss vom Pages-Workflow ausgeliefert werden
+  const wf = readFileSync(join(ROOT, '.github/workflows/deploy-pages.yml'), 'utf8');
+  check('wgsl-deployed', 'gpu.html und solver.wgsl werden deployed',
+    wf.includes('gpu.html') && wf.includes('solver.wgsl'),
+    wf.includes('gpu.html') && wf.includes('solver.wgsl') ? 'Workflow kopiert und verifiziert beide' : 'Workflow kopiert sie nicht');
+}
+
 section('ZUSAMMENFASSUNG');
 const pass = results.filter(r => r.pass).length;
 for (const r of results) if (!r.pass) console.log(`  ❌ ${r.id}: ${r.name} — ${r.detail}`);

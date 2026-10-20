@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kraken 3 — GPU-Validierung gegen das CPU-Oracle</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000409;color:#3affa8;font-family:'Share Tech Mono',ui-monospace,Menlo,Consolas,monospace;
+  padding:22px;font-size:13px;line-height:1.65;max-width:1180px;margin:0 auto}
+h1{font-size:17px;letter-spacing:2px;color:#00ffb3;margin-bottom:4px}
+h2{font-size:13px;letter-spacing:1.5px;color:#0f8;margin:22px 0 8px;border-bottom:1px solid #0f32;padding-bottom:4px}
+.sub{color:#0f68;font-size:12px;margin-bottom:16px}
+table{width:100%;border-collapse:collapse;margin:8px 0}
+th,td{text-align:left;padding:5px 9px;border-bottom:1px solid #0a2a1c;font-size:12px}
+th{color:#0f68;font-weight:400;letter-spacing:1px;text-transform:uppercase;font-size:10px}
+td.num{text-align:right;font-variant-numeric:tabular-nums}
+.ok{color:#00ffb3}.bad{color:#ff3a6e}.warn{color:#ffdd00}.dim{color:#0f68}
+pre{background:rgba(0,12,8,.6);border:1px solid #0f32;border-radius:4px;padding:10px;
+  overflow-x:auto;font-size:11.5px;color:#88ffcc;white-space:pre-wrap}
+.badge{display:inline-block;padding:2px 9px;border-radius:10px;border:1px solid;font-size:11px;letter-spacing:1px}
+.b-ok{border-color:#0f83;color:#00ffb3;background:rgba(0,255,179,.08)}
+.b-bad{border-color:#f445;color:#ff3a6e;background:rgba(255,0,0,.08)}
+.b-wait{border-color:#ff8;color:#ffdd00;background:rgba(255,221,0,.06)}
+#fatal{display:none;margin:14px 0;padding:12px;border:1px solid #f445;background:rgba(60,0,0,.5);border-radius:4px}
+a{color:#0f8}
+button{background:rgba(0,12,8,.85);border:1.5px solid #0f35;color:#0f8;padding:8px 16px;cursor:pointer;
+  border-radius:4px;font-family:inherit;font-size:12px;letter-spacing:1px}
+button:hover{border-color:#0f8;background:rgba(0,255,128,.1)}
+</style>
+</head>
+<body>
+<h1>GPU-VALIDIERUNG</h1>
+<div class="sub">
+  WebGPU-XPBD gegen das CPU-Oracle (<code>src/physics/xpbd.js</code>), auf identischen Eingaben,
+  im selben Browser, zur selben Zeit. <a href="./">← zurück zur Simulation</a>
+</div>
+
+<div id="fatal"></div>
+<div id="status"><span class="badge b-wait">Warte…</span></div>
+
+<h2>Umgebung</h2>
+<table id="env"></table>
+
+<h2>Ergebnisse</h2>
+<table id="res"><thead><tr><th>Check</th><th>Was geprüft wird</th><th class="num">CPU</th><th class="num">GPU</th><th class="num">Abweichung</th><th>Urteil</th></tr></thead><tbody></tbody></table>
+
+<h2>Durchsatz</h2>
+<table id="perf"><thead><tr><th>Tiere (Lanes)</th><th class="num">CPU Kraken-Schritte/s</th><th class="num">GPU Kraken-Schritte/s</th><th class="num">Faktor</th></tr></thead><tbody></tbody></table>
+
+<h2>Log</h2>
+<pre id="log"></pre>
+
+<script type="module">
+import { XpbdWorld } from './src/physics/xpbd.js';
+import { makeMap, mulberry32, findSpawn } from './src/world/map.js';
+import { spawnKraken, tipPosition, attachGrip, adhesionToBreakForce, BODY, ARM_REACH } from './src/body/kraken.js';
+import { toneToCompliance } from './src/body/kraken.js';
+import { isAvailable, create, upload, step, download, loadWgsl } from './src/gpu/gpuworld.js';
+
+const $ = (id) => document.getElementById(id);
+const logEl = $('log');
+const say = (m) => { logEl.textContent += m + '\n'; };
+const row = (t, cells) => {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${t}</td>` + cells.map(c => `<td>${c}</td>`).join('');
+  return tr;
+};
+const envRow = (k, v, cls) => {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td class="dim">${k}</td><td class="${cls || ''}">${v}</td>`;
+  $('env').appendChild(tr);
+};
+let pass = 0, fail = 0;
+function verdict(name, what, cpuVal, gpuVal, ok, tol) {
+  const tr = document.createElement('tr');
+  const cls = ok ? 'ok' : 'bad';
+  const dev = (typeof cpuVal === 'number' && typeof gpuVal === 'number' && cpuVal !== 0)
+    ? ((gpuVal - cpuVal) / Math.abs(cpuVal) * 100).toFixed(2) + ' %' : '—';
+  tr.innerHTML = `<td class="${cls}">${ok ? '✅' : '❌'} ${name}</td><td class="dim">${what}</td>` +
+    `<td class="num">${fmt(cpuVal)}</td><td class="num">${fmt(gpuVal)}</td>` +
+    `<td class="num">${dev}</td><td class="${cls}">${ok ? (tol ? 'innerhalb Toleranz' : 'EXAKT') : 'ABWEICHUNG'}</td>`;
+  $('res').querySelector('tbody').appendChild(tr);
+  if (ok) pass++; else fail++;
+  say(`${ok ? 'OK  ' : 'FAIL'} ${name}: CPU=${fmt(cpuVal)} GPU=${fmt(gpuVal)}${tol ? ' (Toleranz ' + tol + ')' : ' (exakt)'}`);
+}
+const fmt = (v) => (typeof v === 'number' ? (Math.abs(v) < 1e-4 && v !== 0 ? v.toExponential(2) : v.toFixed(4)) : String(v));
+function fatal(msg) {
+  $('fatal').style.display = 'block';
+  $('fatal').innerHTML = '<b style="color:#ff3a6e">Abbruch:</b><pre style="border:0;background:transparent;padding:6px 0 0">' +
+    String(msg).replace(/</g, '&lt;') + '</pre>';
+  $('status').innerHTML = '<span class="badge b-bad">FEHLGESCHLAGEN</span>';
+}
+
+// ── Umgebung ──────────────────────────────────────────────────
+envRow('WebGPU verfügbar', isAvailable() ? 'ja' : 'NEIN', isAvailable() ? 'ok' : 'bad');
+envRow('navigator.gpu', typeof navigator.gpu !== 'undefined' ? 'vorhanden' : 'fehlt');
+envRow('User Agent', navigator.userAgent.slice(0, 90), 'dim');
+if (!isAvailable()) {
+  fatal('Dieser Browser stellt kein navigator.gpu bereit. Chrome/Edge ab 113, Safari ab 26, Firefox ab 141/145.');
+  throw new Error('kein WebGPU');
+}
+
+let adapter, device, wgsl;
+try {
+  say('Adapter wird angefordert…');
+  adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) throw new Error('requestAdapter() lieferte null — GPU deaktiviert oder Treiber blockiert.');
+  envRow('Adapter', adapter.isFallbackAdapter ? 'Fallback (WARP/Software)' : 'Hardware', adapter.isFallbackAdapter ? 'warn' : 'ok');
+  const info = adapter.info || {};
+  if (info.vendor || info.architecture) envRow('Adapter-Info', `${info.vendor || ''} ${info.architecture || ''} ${info.description || ''}`.trim(), 'dim');
+  device = await adapter.requestDevice();
+  envRow('Device', 'angelegt', 'ok');
+  const lim = device.limits;
+  envRow('maxComputeWorkgroupsPerDimension', String(lim.maxComputeWorkgroupsPerDimension), 'dim');
+  envRow('maxStorageBufferBindingSize', (lim.maxStorageBufferBindingSize / 1048576).toFixed(0) + ' MB', 'dim');
+
+  wgsl = await loadWgsl();
+  envRow('Shader geladen', wgsl.length + ' Zeichen', 'ok');
+} catch (e) {
+  fatal(e.message + (e.stack ? '\n\n' + e.stack.split('\n').slice(0, 4).join('\n') : ''));
+  throw e;
+}
+
+// ── Szenario-Bauer: identischer Ausgangszustand für CPU und GPU ──
+function buildWorld(nCreatures, seed, opts = {}) {
+  const map = makeMap(1440, 810, { seed });
+  const rnd = mulberry32(seed ^ 0x5bf03635);
+  const w = new XpbdWorld({ substeps: 2, iterations: 4, h: 1 / 120, maxSpeed: 360, maxAngSpeed: 18 });
+  w.sdf = map.sdf;
+  const ks = [];
+  for (let i = 0; i < nCreatures; i++) {
+    const sp = findSpawn(map, ARM_REACH + 20, rnd);
+    ks.push(spawnKraken(w, sp.x, sp.y, rnd() * Math.PI * 2));
+  }
+  return { world: w, map, krakens: ks };
+}
+function cloneState(src) {
+  const w = src.world;
+  return {
+    px: Float64Array.from(w.px), py: Float64Array.from(w.py),
+    vx: Float64Array.from(w.vx), vy: Float64Array.from(w.vy),
+    ang: Float64Array.from(w.ang), angP: Float64Array.from(w.angP), av: Float64Array.from(w.av),
+    lam: src.krakens.map(k => k.arms.map(a => a.motors.map(m => m.lambda))),
+  };
+}
+
+// ── G1: passives Gleichgewicht (MUSS exakt null sein) ──────────
+say('\n--- G1 passives Gleichgewicht ---');
+{
+  const N = 240;
+  const a = buildWorld(4, 11);
+  const b = buildWorld(4, 11);
+  let gpu;
+  try { gpu = await create(b.world, b.map, wgsl); }
+  catch (e) { fatal('GPU-World konnte nicht angelegt werden:\n' + e.message); throw e; }
+  if (gpu.warnings && gpu.warnings.length) say('  Shader-Warnungen: ' + gpu.warnings.map(w => w.lineNum + ': ' + w.message).join(' | '));
+  upload(gpu);
+  for (let i = 0; i < N; i++) a.world.step();
+  for (let i = 0; i < N; i++) { await step(gpu); }
+  const gs = await download(gpu);
+
+  let cpuPath = 0, gpuPath = 0;
+  for (let ci = 0; ci < a.krakens.length; ci++) {
+    const m = a.krakens[ci].mantle, m2 = b.krakens[ci].mantle;
+    cpuPath += Math.hypot(a.world.px[m] - a.krakens[ci].spawn.x, a.world.py[m] - a.krakens[ci].spawn.y);
+    gpuPath += Math.hypot(b.world.px[m2] - b.krakens[ci].spawn.x, b.world.py[m2] - b.krakens[ci].spawn.y);
+  }
+  verdict('G1 passiv', 'Verschiebung ohne jeden Antrieb, 240 Schritte (Soll: exakt 0)', cpuPath, gpuPath,
+    cpuPath === 0 && gpuPath === 0, false);
+  verdict('G1 maxV', 'Spitzengeschwindigkeit', a.world.stats.maxSpeed, gs.maxSpeed,
+    a.world.stats.maxSpeed === 0 && gs.maxSpeed === 0, false);
+  verdict('G1 NaN', 'NaN-Körper', a.world.stats.nan, gs.nan, gs.nan === 0, false);
+}
+
+// ── G2: Spawn-Constraint-Verletzung ────────────────────────────
+say('\n--- G2 Spawn-Verletzung ---');
+{
+  const a = buildWorld(8, 23);
+  const b = buildWorld(8, 23);
+  const gpu = await create(b.world, b.map, wgsl);
+  const viol = (w) => {
+    let worst = 0;
+    for (const c of w.constraints) {
+      if (c.type !== 0 && c.type !== 2) continue;
+      const A = c.a, B = c.b;
+      const ca = Math.cos(w.ang[A]), sa = Math.sin(w.ang[A]);
+      const gax = w.px[A] + c.lax * ca - c.lay * sa, gay = w.py[A] + c.lax * sa + c.lay * ca;
+      let gbx, gby;
+      if (B >= 0) { const cb = Math.cos(w.ang[B]), sb = Math.sin(w.ang[B]); gbx = w.px[B] + c.lbx * cb - c.lby * sb; gby = w.py[B] + c.lbx * sb + c.lby * cb; }
+      else { gbx = c.lbx; gby = c.lby; }
+      worst = Math.max(worst, Math.hypot(gax - gbx, gay - gby));
+    }
+    return worst;
+  };
+  await step(gpu); await download(gpu);
+  verdict('G2 Verletzung', 'Pin-Constraint-Verletzung nach Upload+1 Schritt (Soll: 0)', viol(a.world), viol(b.world),
+    viol(b.world) < 1e-3, false);
+}
+
+// ── G3: grip-and-pull ─────────────────────────────────────────
+say('\n--- G3 grip-and-pull (Toleranz-Vergleich) ---');
+{
+  const STEPS = 600;
+  const run = async (useGpu) => {
+    const s = buildWorld(1, 31);
+    const w = s.world, k = s.krakens[0], arm = k.arms[0];
+    attachGrip(w, arm, adhesionToBreakForce(1.0));
+    const anchor = { ...tipPosition(w, arm) };
+    const start = Math.hypot(w.px[k.mantle] - anchor.x, w.py[k.mantle] - anchor.y);
+    let gpu = null;
+    if (useGpu) { gpu = await create(w, s.map, wgsl); upload(gpu); }
+    const comp = toneToCompliance(1.0);
+    let minD = start;
+    for (let i = 0; i < STEPS; i++) {
+      for (const m of arm.motors) { m.compliance = comp; }
+      arm.motors[0].target = 0;
+      for (let j = 1; j < arm.motors.length; j++) arm.motors[j].target = BODY.jointLimit * 0.98;
+      for (let a = 1; a < k.arms.length; a++) for (const m of k.arms[a].motors) { m.compliance = toneToCompliance(0.2); m.target = 0; }
+      arm.grip.breakForce = adhesionToBreakForce(1.0);
+      if (useGpu) { await step(gpu); await download(gpu); } else { w.step(); }
+      if (arm.grip.broken) break;
+      const d = Math.hypot(w.px[k.mantle] - anchor.x, w.py[k.mantle] - anchor.y);
+      if (d < minD) minD = d;
+    }
+    return { start, pulled: start - minD, broken: arm.grip.broken };
+  };
+  const cpu = await run(false);
+  const gp = await run(true);
+  say(`  CPU: Start ${cpu.start.toFixed(1)} px, herangezogen ${cpu.pulled.toFixed(1)} px, abgerissen=${cpu.broken}`);
+  say(`  GPU: Start ${gp.start.toFixed(1)} px, herangezogen ${gp.pulled.toFixed(1)} px, abgerissen=${gp.broken}`);
+  const rel = Math.abs(gp.pulled - cpu.pulled) / Math.max(1, cpu.pulled);
+  verdict('G3 Zugweg', 'Herangezogene Distanz am verankerten Arm, 600 Schritte', cpu.pulled, gp.pulled,
+    rel < 0.30 && gp.pulled > cpu.pulled * 0.5, '±30 %');
+  verdict('G3 Bruch', 'Grip-Status identisch', cpu.broken ? 1 : 0, gp.broken ? 1 : 0, cpu.broken === gp.broken, false);
+}
+
+// ── G4: Grenzen und NaN unter Vollast ─────────────────────────
+say('\n--- G4 Grenzen unter Vollast ---');
+{
+  const N = 8, STEPS = 400;
+  const a = buildWorld(N, 47), b = buildWorld(N, 47);
+  const gpu = await create(b.world, b.map, wgsl);
+  upload(gpu);
+  let cpuPeakV = 0, cpuPeakA = 0, cpuNaN = 0, gpuPeakV = 0, gpuPeakA = 0, gpuNaN = 0;
+  for (let i = 0; i < STEPS; i++) {
+    for (const k of a.krakens) for (let ai = 0; ai < k.arms.length; ai++) {
+      const arm = k.arms[ai];
+      for (const m of arm.motors) { m.compliance = toneToCompliance(0.9); m.target = Math.sin(i * 0.2 + ai) * BODY.jointLimit; }
+    }
+    a.world.step();
+    cpuPeakV = Math.max(cpuPeakV, a.world.stats.maxSpeed);
+    cpuPeakA = Math.max(cpuPeakA, a.world.stats.maxAngSpeed);
+    cpuNaN += a.world.stats.nan;
+    await step(gpu);
+    const gs = await download(gpu);
+    gpuPeakV = Math.max(gpuPeakV, gs.maxSpeed); gpuPeakA = Math.max(gpuPeakA, gs.maxAngSpeed); gpuNaN += gs.nan;
+  }
+  verdict('G4 NaN', 'NaN-Ereignisse über ' + STEPS + ' Schritte × ' + N + ' Tiere', cpuNaN, gpuNaN, gpuNaN === 0, false);
+  verdict('G4 maxV', 'Spitzengeschwindigkeit (Limit 360 px/s)', cpuPeakV, gpuPeakV, gpuPeakV <= 360.5, 'Limit');
+  verdict('G4 maxω', 'Spitzen-Winkelgeschwindigkeit (Limit 18 rad/s)', cpuPeakA, gpuPeakA, gpuPeakA <= 18.05, 'Limit');
+}
+
+// ── G5: GPU-Determinismus ─────────────────────────────────────
+say('\n--- G5 GPU-Determinismus ---');
+{
+  const run = async () => {
+    const s = buildWorld(4, 59);
+    const gpu = await create(s.world, s.map, wgsl);
+    upload(gpu);
+    for (const k of s.krakens) for (const arm of k.arms) for (const m of arm.motors) { m.compliance = toneToCompliance(0.8); m.target = 0.5; }
+    for (let i = 0; i < 300; i++) { await step(gpu); }
+    await download(gpu);
+    let h = 0;
+    for (let i = 0; i < s.world.n; i++) {
+      h = (h * 31 + Math.round(s.world.px[i] * 1e4)) | 0;
+      h = (h * 31 + Math.round(s.world.py[i] * 1e4)) | 0;
+    }
+    return h;
+  };
+  const h1 = await run(), h2 = await run();
+  verdict('G5 deterministisch', 'Zwei identische GPU-Läufe → identischer Positions-Hash', h1, h2, h1 === h2, false);
+}
+
+// ── G6: Durchsatz ─────────────────────────────────────────────
+say('\n--- G6 Durchsatz ---');
+for (const N of [1, 64, 512]) {
+  const STEPS = N >= 512 ? 40 : (N >= 64 ? 80 : 200);
+  const a = buildWorld(N, 71);
+  const t0 = performance.now();
+  for (let i = 0; i < STEPS; i++) a.world.step();
+  const cpuMs = performance.now() - t0;
+  const cpuSps = (STEPS * N) / (cpuMs / 1000);
+
+  const b = buildWorld(N, 71);
+  let gpuSps = 0, err = null;
+  try {
+    const gpu = await create(b.world, b.map, wgsl);
+    upload(gpu);
+    for (let i = 0; i < 5; i++) { await step(gpu); }        // Aufwärmen / Pipeline-Bau
+    await b.world; const t1 = performance.now();
+    for (let i = 0; i < STEPS; i++) { await step(gpu); }
+    await download(gpu);
+    gpuSps = (STEPS * N) / ((performance.now() - t1) / 1000);
+  } catch (e) { err = e.message; }
+  const tr = document.createElement('tr');
+  const fac = gpuSps > 0 ? (gpuSps / cpuSps) : 0;
+  tr.innerHTML = `<td class="num">${N}</td><td class="num">${cpuSps.toFixed(0)}</td>` +
+    `<td class="num ${err ? 'bad' : (fac > 1 ? 'ok' : 'warn')}">${err ? 'FEHLER' : gpuSps.toFixed(0)}</td>` +
+    `<td class="num ${fac > 1 ? 'ok' : 'warn'}">${err ? '—' : fac.toFixed(1) + '×'}</td>`;
+  $('perf').querySelector('tbody').appendChild(tr);
+  say(`  N=${N}: CPU ${cpuSps.toFixed(0)} Kraken-Schritte/s, GPU ${err ? 'FEHLER: ' + err : gpuSps.toFixed(0) + ' (' + fac.toFixed(1) + '×)'}`);
+  if (err && N === 1) fatal('GPU-Durchsatz fehlgeschlagen: ' + err);
+}
+
+// ── Fazit ─────────────────────────────────────────────────────
+$('status').innerHTML = fail === 0
+  ? `<span class="badge b-ok">${pass}/${pass + fail} BESTANDEN</span> <span class="dim">GPU-Solver verhält sich wie das CPU-Oracle</span>`
+  : `<span class="badge b-bad">${pass}/${pass + fail} BESTANDEN — ${fail} ABWEICHUNG(EN)</span>`;
+say(`\n=== ${pass}/${pass + fail} bestanden, ${fail} fehlgeschlagen ===`);
+</script>
+</body>
+</html>
