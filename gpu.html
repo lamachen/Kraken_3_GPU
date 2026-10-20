@@ -56,7 +56,7 @@ import { XpbdWorld } from './src/physics/xpbd.js';
 import { makeMap, mulberry32, findSpawn } from './src/world/map.js';
 import { spawnKraken, tipPosition, attachGrip, adhesionToBreakForce, BODY, ARM_REACH } from './src/body/kraken.js';
 import { toneToCompliance } from './src/body/kraken.js';
-import { isAvailable, create, upload, step, download, loadWgsl } from './src/gpu/gpuworld.js';
+import { isAvailable, create, upload, step, download, destroy, loadWgsl } from './src/gpu/gpuworld.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
@@ -72,6 +72,7 @@ const envRow = (k, v, cls) => {
   $('env').appendChild(tr);
 };
 let pass = 0, fail = 0;
+const gpuHash = (w) => { let h = 0; for (let i = 0; i < w.n; i++) { h = (h * 31 + Math.round(w.px[i] * 1e4)) | 0; h = (h * 31 + Math.round(w.py[i] * 1e4)) | 0; } return h; };
 function verdict(name, what, cpuVal, gpuVal, ok, tol) {
   const tr = document.createElement('tr');
   const cls = ok ? 'ok' : 'bad';
@@ -105,7 +106,12 @@ let adapter, device, wgsl;
 try {
   say('Adapter wird angefordert…');
   adapter = await navigator.gpu.requestAdapter();
-  if (!adapter) throw new Error('requestAdapter() lieferte null — GPU deaktiviert oder Treiber blockiert.');
+  if (!adapter) throw new Error(
+    'requestAdapter() lieferte null. Das heißt NICHT zwingend, dass die GPU fehlt: ' +
+    'der GPU-Prozess kann überlastet oder gecrasht sein (viele WebGPU-Devices, ' +
+    'Treiber-Reset, Tab im Hintergrund, Energiesparmodus). ' +
+    'Seite mit Strg+Shift+R neu laden. Bleibt es: chrome://gpu öffnen und prüfen, ' +
+    'ob "WebGPU" als enabled gelistet ist.');
   envRow('Adapter', adapter.isFallbackAdapter ? 'Fallback (WARP/Software)' : 'Hardware', adapter.isFallbackAdapter ? 'warn' : 'ok');
   const info = adapter.info || {};
   if (info.vendor || info.architecture) envRow('Adapter-Info', `${info.vendor || ''} ${info.architecture || ''} ${info.description || ''}`.trim(), 'dim');
@@ -152,7 +158,7 @@ say('\n--- G1 passives Gleichgewicht ---');
   const a = buildWorld(4, 11);
   const b = buildWorld(4, 11);
   let gpu;
-  try { gpu = await create(b.world, b.map, wgsl); }
+  try { gpu = await create(b.world, b.map, wgsl, device); }
   catch (e) { fatal('GPU-World konnte nicht angelegt werden:\n' + e.message); throw e; }
   if (gpu.warnings && gpu.warnings.length) say('  Shader-Warnungen: ' + gpu.warnings.map(w => w.lineNum + ': ' + w.message).join(' | '));
   upload(gpu);
@@ -171,6 +177,7 @@ say('\n--- G1 passives Gleichgewicht ---');
   verdict('G1 maxV', 'Spitzengeschwindigkeit', a.world.stats.maxSpeed, gs.maxSpeed,
     a.world.stats.maxSpeed === 0 && gs.maxSpeed === 0, false);
   verdict('G1 NaN', 'NaN-Körper', a.world.stats.nan, gs.nan, gs.nan === 0, false);
+  destroy(gpu);
 }
 
 // ── G2: Spawn-Constraint-Verletzung ────────────────────────────
@@ -178,7 +185,7 @@ say('\n--- G2 Spawn-Verletzung ---');
 {
   const a = buildWorld(8, 23);
   const b = buildWorld(8, 23);
-  const gpu = await create(b.world, b.map, wgsl);
+  const gpu = await create(b.world, b.map, wgsl, device);
   const viol = (w) => {
     let worst = 0;
     for (const c of w.constraints) {
@@ -196,6 +203,7 @@ say('\n--- G2 Spawn-Verletzung ---');
   await step(gpu); await download(gpu);
   verdict('G2 Verletzung', 'Pin-Constraint-Verletzung nach Upload+1 Schritt (Soll: 0)', viol(a.world), viol(b.world),
     viol(b.world) < 1e-3, false);
+  destroy(gpu);
 }
 
 // ── G3: grip-and-pull ─────────────────────────────────────────
@@ -209,7 +217,7 @@ say('\n--- G3 grip-and-pull (Toleranz-Vergleich) ---');
     const anchor = { ...tipPosition(w, arm) };
     const start = Math.hypot(w.px[k.mantle] - anchor.x, w.py[k.mantle] - anchor.y);
     let gpu = null;
-    if (useGpu) { gpu = await create(w, s.map, wgsl); upload(gpu); }
+    if (useGpu) { gpu = await create(w, s.map, wgsl, device); upload(gpu); }
     const comp = toneToCompliance(1.0);
     let minD = start;
     for (let i = 0; i < STEPS; i++) {
@@ -223,7 +231,9 @@ say('\n--- G3 grip-and-pull (Toleranz-Vergleich) ---');
       const d = Math.hypot(w.px[k.mantle] - anchor.x, w.py[k.mantle] - anchor.y);
       if (d < minD) minD = d;
     }
-    return { start, pulled: start - minD, broken: arm.grip.broken };
+    const res = { start, pulled: start - minD, broken: arm.grip.broken };
+    if (gpu) destroy(gpu);
+    return res;
   };
   const cpu = await run(false);
   const gp = await run(true);
@@ -240,7 +250,7 @@ say('\n--- G4 Grenzen unter Vollast ---');
 {
   const N = 8, STEPS = 400;
   const a = buildWorld(N, 47), b = buildWorld(N, 47);
-  const gpu = await create(b.world, b.map, wgsl);
+  const gpu = await create(b.world, b.map, wgsl, device);
   upload(gpu);
   let cpuPeakV = 0, cpuPeakA = 0, cpuNaN = 0, gpuPeakV = 0, gpuPeakA = 0, gpuNaN = 0;
   for (let i = 0; i < STEPS; i++) {
@@ -259,6 +269,7 @@ say('\n--- G4 Grenzen unter Vollast ---');
   verdict('G4 NaN', 'NaN-Ereignisse über ' + STEPS + ' Schritte × ' + N + ' Tiere', cpuNaN, gpuNaN, gpuNaN === 0, false);
   verdict('G4 maxV', 'Spitzengeschwindigkeit (Limit 360 px/s)', cpuPeakV, gpuPeakV, gpuPeakV <= 360.5, 'Limit');
   verdict('G4 maxω', 'Spitzen-Winkelgeschwindigkeit (Limit 18 rad/s)', cpuPeakA, gpuPeakA, gpuPeakA <= 18.05, 'Limit');
+  destroy(gpu);
 }
 
 // ── G5: GPU-Determinismus ─────────────────────────────────────
@@ -266,7 +277,7 @@ say('\n--- G5 GPU-Determinismus ---');
 {
   const run = async () => {
     const s = buildWorld(4, 59);
-    const gpu = await create(s.world, s.map, wgsl);
+    const gpu = await create(s.world, s.map, wgsl, device);
     upload(gpu);
     for (const k of s.krakens) for (const arm of k.arms) for (const m of arm.motors) { m.compliance = toneToCompliance(0.8); m.target = 0.5; }
     for (let i = 0; i < 300; i++) { await step(gpu); }
@@ -295,13 +306,14 @@ for (const N of [1, 64, 512]) {
   const b = buildWorld(N, 71);
   let gpuSps = 0, err = null;
   try {
-    const gpu = await create(b.world, b.map, wgsl);
+    const gpu = await create(b.world, b.map, wgsl, device);
     upload(gpu);
     for (let i = 0; i < 5; i++) { await step(gpu); }        // Aufwärmen / Pipeline-Bau
     await b.world; const t1 = performance.now();
     for (let i = 0; i < STEPS; i++) { await step(gpu); }
     await download(gpu);
     gpuSps = (STEPS * N) / ((performance.now() - t1) / 1000);
+    destroy(gpu);
   } catch (e) { err = e.message; }
   const tr = document.createElement('tr');
   const fac = gpuSps > 0 ? (gpuSps / cpuSps) : 0;

@@ -29,14 +29,28 @@ export function isAvailable() {
   return typeof navigator !== 'undefined' && !!navigator.gpu;
 }
 
-export async function create(cpu, map, wgslSource) {
-  if (!isAvailable()) {
-    throw new Error('WebGPU ist in diesem Browser nicht verfügbar (navigator.gpu fehlt). ' +
-      'Chrome/Edge ab 113, Safari ab 26, Firefox ab 141/145.');
+export async function create(cpu, map, wgslSource, device) {
+  // `device` MUSS von außen kommen, wenn mehrere Welten gebaut werden.
+  //
+  // Gemessen: gpu.html baut ~10 Welten (G1..G6), und jede rief hier
+  // requestAdapter() + requestDevice() auf. Irgendwann lieferte
+  // requestAdapter() null auf einer Maschine, die Minuten zuvor noch
+  // "nvidia ampere RTX 3070 Ti" gemeldet hatte — der GPU-Prozess war
+  // überlastet bzw. gecrasht. Ein geteiltes Device behebt das und ist
+  // nebenbei schneller: kein wiederholter Pipeline-/Device-Aufbau.
+  if (!device) {
+    if (!isAvailable()) {
+      throw new Error('WebGPU ist in diesem Browser nicht verfügbar (navigator.gpu fehlt). ' +
+        'Chrome/Edge ab 113, Safari ab 26, Firefox ab 141/145.');
+    }
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      throw new Error('requestAdapter() lieferte null. Häufigste Ursache: der GPU-Prozess ' +
+        'ist überlastet oder gecrasht (viele Devices, Treiber-Reset, Tab im Hintergrund). ' +
+        'Seite mit Strg+Shift+R neu laden; bleibt es, chrome://gpu prüfen.');
+    }
+    device = await adapter.requestDevice();
   }
-  const adapter = await navigator.gpu.requestAdapter();
-  if (!adapter) throw new Error('Kein WebGPU-Adapter gefunden — GPU deaktiviert oder Treiber blockiert.');
-  const device = await adapter.requestDevice();
 
   const nB = cpu.n;
   const nC = cpu.constraints.length;
@@ -249,6 +263,19 @@ export async function download(g) {
 
 /** Relativer Pfad zum Shader — gpu.html fetcht ihn und übergibt ihn an create(). */
 export const WGSL_PATH = 'src/gpu/solver.wgsl';
+
+/**
+ * Gibt alle Buffer der Welt frei. Wichtig, wenn Szenarien nacheinander laufen:
+ * ungefreed storage buffer halten Device-Speicher und tragen zur Überlastung bei,
+ * die requestAdapter() später mit null beantwortet.
+ */
+export function destroy(g) {
+  if (!g) return;
+  for (const k of Object.keys(g.buffers)) {
+    try { g.buffers[k].destroy(); } catch (e) { /* bereits zerstört */ }
+  }
+  g.buffers = {};
+}
 
 export async function loadWgsl(base = '') {
   const url = base ? base + '/' + WGSL_PATH : WGSL_PATH;
