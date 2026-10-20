@@ -10,6 +10,7 @@ import { XpbdWorld } from '../physics/xpbd.js';
 import { makeMap, findSpawn, mulberry32, tickMapLights } from '../world/map.js';
 import { spawnKraken, tipPosition, attachGrip, releaseGrip, armCurl, armExtension, toneToCompliance, adhesionToBreakForce, BODY, ARM_REACH } from '../body/kraken.js';
 import { makeEntity, tickEntity, KIND_PREY } from '../world/entities.js';
+import { measureReach } from './fitness.js';
 import { createEcho, emit as emitEcho, tick as tickEcho, write as writeEcho, ECHO_DIM } from '../senses/echo.js';
 import { createChem, sample as sampleChem, write as writeChem, CHEM_DIM } from '../senses/chem.js';
 import { createLight, sample as sampleLight, write as writeLight, LIGHT_DIM } from '../senses/light.js';
@@ -46,7 +47,11 @@ export function createSim(opts = {}) {
     // die Arme in Wänden und die Kollisionsprojektion katapultiert sie heraus.
     const sp = findSpawn(map, ARM_REACH + 20, rnd);
     const k = spawnKraken(world, sp.x, sp.y, rnd() * Math.PI * 2);
-    creatures.push(makeCreature(world, k, map, o, i));
+    const cr = makeCreature(world, k, map, o, i);
+    // Verfügbaren Freiraum beim Spawn vermessen — ohne das ist die Fitness
+    // reine Lotterie (wer in einer Nische spawnt, kann nie weit kommen).
+    cr.spawnReach = measureReach(map, sp.x, sp.y);
+    creatures.push(cr);
   }
   // Beute-Entitäten: Duft- und Geräuschquellen. Milestone 4 ergänzt/augmentiert
   // das um einen Bewohner-Agenten mit Policy — dieselbe Struktur.
@@ -73,6 +78,7 @@ function makeCreature(world, k, map, opts, index) {
     prevVx: 0, prevVy: 0, ax: 0, ay: 0,
     pathLen: 0, maxDisplacement: 0, angularAccum: 0, forwardProg: 0,
     gripPullProg: 0, anchoredSteps: 0, anchoredSum: 0, gripCycles: 0,
+    freeMove: 0, energySpent: 0, hits: 0, preyMinDist: Infinity, spawnReach: 300,
     wasAnchored: false, prevSpawnDist: 0, steps: 0,
     meanExtension: 1, meanCurl: 0,
   };
@@ -280,6 +286,11 @@ export function postStep(c) {
   } else {
     c.prevSpawnDist = Math.hypot(c.x - c.spawn.x, c.y - c.spawn.y);
   }
+  if (anchored === 0 && stepDist > 0.3) c.freeMove += stepDist;
+  // Energie: Muskeltonus und Haftstärke kosten, Bewegung kostet.
+  // Bewusst KEIN Bonus dafür, überhaupt Energie auszugeben — v2 hatte
+  // `idleP − energySpent*1.5` und belohnte damit Verschwendung.
+  c.energySpent += (c.tone * 0.0006 + stepDist * 0.0004) * c.arms.length;
   if (anchored > 0 && !c.wasAnchored) c.gripCycles++;
   c.wasAnchored = anchored > 0;
   c.maxDisplacement = Math.max(c.maxDisplacement, Math.hypot(c.x - c.spawn.x, c.y - c.spawn.y));

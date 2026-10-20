@@ -491,6 +491,102 @@ if (want('input')) {
     `${senseActive}/${SENSE_DIM} Sinne liefern Werte (Echolot/Chem/Licht/Gehör/Tast)`);
 }
 
+section('CHECK N1 — NETZ: keine Sättigung, Ausgabe im gültigen Bereich');
+if (want('net')) {
+  const { inputDim, weightCount, randomGenome, forwardInto, decode, HIDDEN, OUT_DIM } = await import('../src/brain/net.js');
+  const nIn = inputDim(42, 43);
+  let seed = 99;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  const nW = weightCount(nIn, HIDDEN, OUT_DIM);
+  let saturated = 0, nonfinite = 0, trials = 0;
+  for (let t = 0; t < 40; t++) {
+    const w = randomGenome(nIn, HIDDEN, OUT_DIM, rnd);
+    const x = new Float64Array(nIn), out = new Float32Array(OUT_DIM), sc = new Float32Array(2 * HIDDEN);
+    for (let i = 0; i < nIn; i++) x[i] = Math.sin(i * 0.37 + t) * 0.8;
+    forwardInto(w, x, out, sc, nIn, HIDDEN, OUT_DIM);
+    for (const v of out) { trials++; if (!Number.isFinite(v)) nonfinite++; if (Math.abs(Math.abs(v) - 1) < 1e-4) saturated++; }
+  }
+  check('net-finite', 'Netz-Ausgaben endlich und in [-1,1]', nonfinite === 0, `${nonfinite}/${trials} ungültig`);
+  // Sättigung würde den Selektionsgradienten töten: alle Genome geben ±1 aus.
+  // v2 initialisierte mit (rnd()-0.5)*1.6 über 64 Eingänge — Varianz der
+  // Voraktivierung ~25× zu groß, jedes tanh sofort gesättigt.
+  check('net-unsaturated', 'Ausgaben nicht gesättigt (1/√fan_in-Skalierung)', saturated / trials < 0.15,
+    `${saturated}/${trials} = ${(saturated / trials * 100).toFixed(1)} % exakt ±1`);
+  const ctl = { tone: 0, arms: Array.from({ length: 6 }, () => ({ shoulder: 0, curl: 0, adhesion: 0 })), emitEcho: false };
+  const out = new Float32Array(OUT_DIM); out[1 + 2 * 3 + 2] = -0.7;
+  decode(out, ctl, 6);
+  check('net-decode', 'Negative Haftstärke wird zu 0 (nicht-klebrig als Nullpunkt)',
+    ctl.arms[2].adhesion === 0, `adhesion = ${ctl.arms[2].adhesion}`);
+  check('net-dim', `Genomgröße = ${nW} bei ${nIn} Eingängen`, nW === nIn * HIDDEN + HIDDEN + HIDDEN * HIDDEN + HIDDEN + HIDDEN * OUT_DIM + OUT_DIM,
+    `${nW} Gewichte (Kraken_v2: 5307)`);
+}
+
+section('CHECK N2 — ES konvergiert gegen eine bekannte Zielfunktion');
+if (want('es')) {
+  // Sanity-Test des Optimierers selbst, unabhängig von der Simulation:
+  // maximiere f(x) = -||x - ziel||² über 64 Dimensionen.
+  const { createES, genomeAt, update } = await import('../src/brain/es.js');
+  const N = 64;
+  // lr 0.25 war zu aggressiv: der Optimierer schwang um das Optimum
+  // (Abstand @60/120/180/240/300 = 1.80 / 2.10 / 2.31 / 1.81 / 2.18 — keine
+  // Konvergenz). Mit lr ≤ 0.10 konvergiert er auf ~9 % Restabstand.
+  // Die Produktions-Defaults in es.js (sigma 0.06, lr 0.030) liegen im stabilen
+  // Bereich; hier wird sigma wegen der größeren Zieldistanz (5.6) hochgesetzt.
+  const es = createES(N, { popSize: 32, sigma: 0.5, lr: 0.08, sigmaDecay: 1.0 });
+  let seed = 4242;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  const target = new Float64Array(N);
+  for (let i = 0; i < N; i++) target[i] = Math.sin(i * 0.7);
+  const g = new Float64Array(N);
+  const fit = new Float64Array(32);
+  const d0 = dist(es.theta, target);
+  for (let gen = 0; gen < 200; gen++) {
+    for (let i = 0; i < 32; i++) {
+      genomeAt(es, i, g, rnd);
+      fit[i] = -dist(g, target);
+    }
+    update(es, fit);
+  }
+  const d1 = dist(es.theta, target);
+  function dist(a, b) { let s = 0; for (let i = 0; i < N; i++) s += (a[i] - b[i]) ** 2; return Math.sqrt(s); }
+  check('es-converges', 'ES minimiert den Abstand zum Ziel (64 Dim, 200 Generationen)', d1 < d0 * 0.25,
+    `Abstand ${d0.toFixed(2)} → ${d1.toFixed(2)} (${(d1 / d0 * 100).toFixed(0)} %)`);
+  // Gespiegelte Paare müssen korrelieren: θ+σε und θ−σε
+  const es2 = createES(8, { popSize: 4, sigma: 1 });
+  const a = new Float64Array(8), b = new Float64Array(8);
+  genomeAt(es2, 0, a, rnd); genomeAt(es2, 1, b, rnd);
+  let mirror = true;
+  for (let i = 0; i < 8; i++) if (Math.abs((a[i] - es2.theta[i]) + (b[i] - es2.theta[i])) > 1e-9) mirror = false;
+  check('es-mirrored', 'Perturbationen sind exakt gespiegelt (Varianzreduktion)', mirror,
+    mirror ? 'θ+σε und θ−σε teilen dasselbe ε' : 'Spiegelung defekt');
+}
+
+section('CHECK N3 — TRAININGSLAUF ist deterministisch und steigt');
+if (want('train')) {
+  const { createTrainer, beginGeneration, trainStep, endGeneration } = await import('../src/sim/train.js');
+  const runs = [];
+  for (let r = 0; r < 2; r++) {
+    const tr = createTrainer({ popSize: 16, stepsPerGen: 150, seed: 7, prey: 0 });
+    const hist = [];
+    for (let g = 0; g < 8; g++) {
+      beginGeneration(tr);
+      for (let s = 0; s < 150; s++) trainStep(tr);
+      hist.push(endGeneration(tr));
+    }
+    runs.push(hist);
+  }
+  const same = JSON.stringify(runs[0].map(h => h.best.toFixed(6))) === JSON.stringify(runs[1].map(h => h.best.toFixed(6)));
+  check('train-determinism', 'Zwei Läufe mit gleichem Seed sind bit-identisch', same,
+    same ? 'reproduzierbar' : 'DIVERGENT — Messreihen wären wertlos');
+  const first = runs[0].slice(0, 3).reduce((s, h) => s + h.mean, 0) / 3;
+  const last = runs[0].slice(-3).reduce((s, h) => s + h.mean, 0) / 3;
+  check('train-improves', 'Mittlerer Score steigt über 8 Generationen', last > first,
+    `${first.toFixed(1)} → ${last.toFixed(1)} (${((last - first) / Math.abs(first) * 100).toFixed(0)} %)`);
+  const a0 = runs[0][0].anchor, a1 = runs[0][runs[0].length - 1].anchor;
+  check('train-grips', 'Anker-Rate steigt (Haften wird entdeckt)', a1 > a0,
+    `${(a0 * 100).toFixed(0)} % → ${(a1 * 100).toFixed(0)} %`);
+}
+
 section('CHECK 11 — KARTEN-ABDECKUNG / SPAWN');
 if (want('map')) {
   const map = makeMap(1440, 810, { seed: 7 });
