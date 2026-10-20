@@ -225,6 +225,7 @@ say('\n--- G1 passives Gleichgewicht ---');
     gpuPath2 += Math.hypot(b.world.px[m2] - b.krakens[ci2].spawn.x, b.world.py[m2] - b.krakens[ci2].spawn.y);
   }
   const grew = gpuPath2 - gpuPath;
+  const cpuGrew = cpuPath2 - cpuPath;
   verdict('G1 passiv', 'Verschiebung ohne Antrieb, 240 Schritte (f32-Boden, Soll ≈0)', cpuPath, gpuPath, gpuPath < 0.05, '< 0.05 px');
   verdict('G1 Wachstum', '+2160 Schritte: Drift wächst NICHT linear (Energie-Injektion?)', grew, grew, grew < 0.05, '< 0.05 px');
   say('    (Kraken_v2 auf matter-js lieferte im selben Test 964 px — als Referenzmarke)');

@@ -69,7 +69,7 @@ console.log('\n── Params-Uniform ──');
 console.log('\n── Entry-Points ──');
 {
   const eps = [...clean.matchAll(/@compute\s*@workgroup_size\(\d+\)\s*fn\s+(\w+)/g)].map(m => m[1]);
-  const need = ['integrate', 'solveConstraints', 'solveCollisions', 'finalize', 'gripBreak'];
+  const need = ['resetLambda', 'integrate', 'solveConstraints', 'solveCollisions', 'finalize', 'gripBreak'];
   for (const e of need) {
     if (!eps.includes(e)) bad(`Entry-Point ${e} fehlt im Shader`);
     else if (!js.includes(`mk('${e}')`)) bad(`${e} wird in gpuworld.js nicht als Pipeline angelegt`);
