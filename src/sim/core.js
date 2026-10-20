@@ -54,7 +54,7 @@ export function createSim(opts = {}) {
     for (const c of all) {
       if (seen.has(c)) continue;
       seen.add(c);
-      if (c.color === undefined) c.color = assignColor(colorMask, c.a, c.b >= 0 ? c.b : -1);
+      if (c.color < 0) c.color = assignColor(colorMask, c.a, c.b >= 0 ? c.b : -1);
     }
     const cr = makeCreature(world, k, map, o, i);
     // Verfügbaren Freiraum beim Spawn vermessen — ohne das ist die Fitness
@@ -67,7 +67,7 @@ export function createSim(opts = {}) {
   const entities = [];
   for (let i = 0; i < o.prey; i++) {
     const sp = findSpawn(map, 40, rnd);
-    entities.push(makeEntity(KIND_PREY, sp.x, sp.y, { scent: 1.0, speed: o.preySpeed }));
+    entities.push(makeEntity(KIND_PREY, sp.x, sp.y, { scent: 1.0, speed: o.preySpeed, rnd }));
   }
   groupConstraintsByColor(world);
   return { world, map, creatures, entities, opts: o, rnd, time: 0, stepCount: 0 };

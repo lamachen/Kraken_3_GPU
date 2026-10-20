@@ -645,6 +645,149 @@ if (want('train')) {
     `${(a0 * 100).toFixed(0)} % → ${(a1 * 100).toFixed(0)} %`);
 }
 
+section('CHECK G8 — HYBRID-TRAINER: Spiegel-Feldmapping + Passthrough-Identität (M3c)');
+if (want('gputrain')) {
+  const { mirrorInto, packControls, GPU_STRIDES } = await import('../src/gpu/gpuworld.js');
+  const { createTrainer, beginGeneration, trainStep, endGeneration } = await import('../src/sim/train.js');
+  const { gpuTrainStep, beginGenerationGpu, passthroughBackend } = await import('../src/sim/gputrain.js');
+
+  // ── G8a: mirrorInto() muss JEDES Feld an die richtige Stelle legen. ──
+  // Der Hybrid-Trainer läuft komplett auf diesem Spiegel: fehlt ein Feld
+  // (z. B. av oder grip.force), trainiert die GPU-Variante gegen eine andere
+  // Propriozeption als die CPU — stillschweigend und unheilbar.
+  {
+    const sim = createSim({ seed: 31, creatures: 2 });
+    const w = sim.world, nB = w.n, nC = w.constraints.length;
+    const bd = new Float32Array(nB * GPU_STRIDES.body);
+    const cd = new Float32Array(nC * GPU_STRIDES.constraint);
+    const cu = new Uint32Array(cd.buffer);
+    for (let i = 0; i < nB; i++) {
+      const o = i * GPU_STRIDES.body;
+      bd[o] = 100 + i * 0.5; bd[o + 1] = -200 + i * 0.25;
+      bd[o + 4] = 1 + i * 0.01; bd[o + 5] = -2 - i * 0.01;
+      bd[o + 6] = 0.3 + i * 0.001; bd[o + 8] = 0.05 + i * 0.002;
+    }
+    for (let k = 0; k < nC; k++) {
+      const o = k * GPU_STRIDES.constraint;
+      cd[o + 13] = 0.5 + k * 0.001; cd[o + 14] = -0.25 + k * 0.001; cd[o + 15] = k * 0.002;
+      cu[o + 17] = k % 2;                     // gebrochen im Wechsel — ÜBER u32
+    }
+    const stats = mirrorInto(w, bd, cd);
+    let bodyOk = true;
+    for (let i = 0; i < nB && bodyOk; i++) {
+      bodyOk = w.px[i] === bd[i * 12] && w.py[i] === bd[i * 12 + 1]
+        && w.vx[i] === bd[i * 12 + 4] && w.vy[i] === bd[i * 12 + 5]
+        && w.ang[i] === bd[i * 12 + 6] && w.av[i] === bd[i * 12 + 8];
+    }
+    let consOk = true, gripOk = true, nGrips = 0;
+    const invH = 1 / w.h;
+    for (let k = 0; k < nC; k++) {
+      const c = w.constraints[k];
+      if (c.lambda !== cd[k * 20 + 15]) consOk = false;
+      if (c.broken !== (k % 2 === 1)) consOk = false;
+      if (c.type === 2) {
+        nGrips++;
+        const fx = cd[k * 20 + 13], fy = cd[k * 20 + 14];
+        if (c.lambdaX !== fx || c.lambdaY !== fy) gripOk = false;
+        if (c.force !== Math.hypot(fx, fy) * invH) gripOk = false;   // Parität _postGripBreak
+      }
+    }
+    let expMaxV = 0;
+    for (let i = 0; i < nB; i++) { const vx = bd[i * 12 + 4], vy = bd[i * 12 + 5]; expMaxV = Math.max(expMaxV, Math.sqrt(vx * vx + vy * vy)); }
+    const statsOk = stats.maxSpeed === expMaxV && stats.nan === 0;
+    check('mirror-fields', `mirrorInto: ${nB} Körper, ${nC} Constraints (${nGrips} Grips) exakt gespiegelt`,
+      bodyOk && consOk && gripOk && statsOk,
+      `Körper=${bodyOk} λ/broken=${consOk} Grip-force=${gripOk} Stats=${statsOk} (broken läuft über die Uint32-Sicht)`);
+  }
+
+  // ── G8b: packControls() — Offsets + lbx/lby-Sync des Saugnapf-Reflexes. ──
+  // Ohne lbx/lby würde ein mitten in der Episode neu verankerter Grip auf der
+  // GPU am ALTEN Anker ziehen (Spawn-Position) — unsichtbar falsch.
+  {
+    const sim = createSim({ seed: 33, creatures: 1 });
+    const w = sim.world, nC = w.constraints.length;
+    const cd = new Float32Array(nC * GPU_STRIDES.constraint);
+    const cu = new Uint32Array(cd.buffer);
+    for (let k = 0; k < nC; k++) {
+      const c = w.constraints[k];
+      c.compliance = 0.123 + k * 1e-4; c.target = 0.01 * k;
+      c.breakForce = k % 3 === 0 ? Infinity : 5 + k;
+      c.broken = k % 2 === 0; c.lbx = 11 + k; c.lby = -22 - k;
+    }
+    packControls(w, cd);
+    let ok = true, firstBad = -1;
+    for (let k = 0; k < nC; k++) {
+      const c = w.constraints[k], o = k * GPU_STRIDES.constraint;
+      const good = cd[o + 6] === Math.fround(c.lbx) && cd[o + 7] === Math.fround(c.lby)
+        && cd[o + 8] === Math.fround(c.compliance) && cd[o + 10] === Math.fround(c.target)
+        && cd[o + 16] === Math.fround(Math.min(c.breakForce, 1e30))
+        && cu[o + 17] === (c.broken ? 1 : 0);
+      if (!good && firstBad < 0) firstBad = k;
+      ok = ok && good;
+    }
+    check('pack-controls', `packControls: Anker lbx/lby + Steuerfelder auf WGSL-Offsets (${nC} Constraints)`,
+      ok, ok ? 'compliance o+8, tgt o+10, lbx/lby o+6/7, breakForce o+16 (∞→1e30), broken o+17 u32' : `Feld falsch ab Constraint ${firstBad}`);
+  }
+
+  // ── G8c: Beute-Determinismus — der Math.random()-Bug in makeEntity. ──
+  // Gefangen vom Passthrough-Check: zwei Trainer mit gleichem Seed drifteten
+  // ab Schritt 85 auseinander, weil heading/seed der Beute aus Math.random()
+  // kamen. Mit prey=0 unsichtbar (M3a lief so), mit prey>0 wären alle
+  // Messreihen nicht reproduzierbar gewesen.
+  {
+    const { createSim } = await import('../src/sim/core.js');
+    const s1 = createSim({ seed: 5, creatures: 1, prey: 2 });
+    const s2 = createSim({ seed: 5, creatures: 1, prey: 2 });
+    const same = s1.entities.length === s2.entities.length && s1.entities.every((e, i) => {
+      const f = s2.entities[i];
+      return e.x === f.x && e.y === f.y && e.heading === f.heading && e.seed === f.seed;
+    });
+    check('prey-determinism', 'Beute-Entitäten aus gleichem Seed sind identisch (heading/seed)',
+      same, same ? `${s1.entities.length} Entitäten bit-identisch (fix: makeEntity nutzt sim.rnd)` : 'Math.random() läuft noch mit');
+  }
+
+  // ── G8d: Passthrough-Identität — dieselbe Verdrahtung, bit-identisches Ergebnis. ──
+  // gpuTrainStep mit Passthrough-Backend (Physik = CPU, Spiegel-Pfade gezählt)
+  // MUSS exakt die Fitness des reinen CPU-Trainers liefern. Jeder Unterschied
+  // ist ein Verdrahtungsfehler (Reihenfolge, fehlendes tickSenses, Doppel-
+  // Control …) — unabhängig von f32/f64, deshalb EXAKT und nicht Toleranz.
+  {
+    const OPTS = { popSize: 8, stepsPerGen: 120, seed: 7, prey: 2 };
+    const trA = createTrainer(OPTS);                       // Referenz: train.js
+    const trB = createTrainer(OPTS);                       // Hybrid: gputrain.js
+    const counters = {};
+    const backend = passthroughBackend(trB.sim, counters);
+    const histA = [], histB = [];
+    let fitnessIdentical = true;
+    for (let g = 0; g < 2; g++) {
+      beginGeneration(trA);
+      beginGenerationGpu(trB, backend);
+      for (let s = 0; s < OPTS.stepsPerGen; s++) {
+        trainStep(trA);
+        await gpuTrainStep(trB, backend);
+      }
+      histA.push(endGeneration(trA));
+      histB.push(endGeneration(trB));
+      for (let i = 0; i < OPTS.popSize; i++) {
+        if (trA.fitness[i] !== trB.fitness[i]) fitnessIdentical = false;
+      }
+    }
+    let stateIdentical = true;
+    for (let i = 0; i < trA.sim.world.n; i++) {
+      if (trA.sim.world.px[i] !== trB.sim.world.px[i] || trA.sim.world.py[i] !== trB.sim.world.py[i]
+        || trA.sim.world.ang[i] !== trB.sim.world.ang[i]) stateIdentical = false;
+    }
+    const histIdentical = histA.every((h, gi) => h.best === histB[gi].best && h.mean === histB[gi].mean);
+    const nSteps = 2 * OPTS.stepsPerGen;
+    const callsOk = counters.upload === 2 && counters.uploadControls === nSteps
+      && counters.step === nSteps && counters.download === nSteps;
+    check('gputrain-identical', 'Hybrid-Trainer (Passthrough) = CPU-Trainer, 2 Gen × 8 Tiere × 120 Schritte',
+      fitnessIdentical && stateIdentical && histIdentical && callsOk,
+      `Fitness bit-identisch=${fitnessIdentical} Weltzustand=${stateIdentical} Historie=${histIdentical} ` +
+      `Aufrufe=${callsOk} (upload ${counters.upload}/2, controls ${counters.uploadControls}/${nSteps}, step ${counters.step}/${nSteps}, download ${counters.download}/${nSteps})`);
+  }
+}
+
 section('CHECK 11 — KARTEN-ABDECKUNG / SPAWN');
 if (want('map')) {
   const map = makeMap(1440, 810, { seed: 7 });

@@ -34,7 +34,8 @@ button:hover{border-color:#0f8;background:rgba(0,255,128,.1)}
 <div class="sub">
   Build <b id="stamp" style="color:#ffdd00">…</b> ·
   WebGPU-XPBD gegen das CPU-Oracle (<code>src/physics/xpbd.js</code>), auf identischen Eingaben,
-  im selben Browser, zur selben Zeit. <a href="./">← zurück zur Simulation</a>
+  im selben Browser, zur selben Zeit. G1–G6 prüfen den Solver, G7–G8 den Hybrid-Trainer
+  (Physik GPU, Sinne/Netz/ES CPU). <a href="./">← zurück zur Simulation</a>
 </div>
 
 <div id="fatal"></div>
@@ -58,6 +59,8 @@ import { makeMap, mulberry32, findSpawn } from './src/world/map.js';
 import { spawnKraken, tipPosition, attachGrip, adhesionToBreakForce, BODY, ARM_REACH } from './src/body/kraken.js';
 import { toneToCompliance } from './src/body/kraken.js';
 import { isAvailable, create, upload, uploadControls, step, download, destroy, loadWgsl } from './src/gpu/gpuworld.js';
+import { createTrainer, endGeneration } from './src/sim/train.js';
+import { gpuTrainStep, beginGenerationGpu, runGpuTraining, gpuBackend } from './src/sim/gputrain.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
@@ -406,6 +409,90 @@ for (const N of [1, 64, 512]) {
   $('perf').querySelector('tbody').appendChild(tr);
   say(`  N=${N}: CPU ${cpuSps.toFixed(0)} Kraken-Schritte/s, GPU ${err ? 'FEHLER: ' + err : gpuSps.toFixed(0) + ' (' + fac.toFixed(1) + '×)'}`);
   if (err && N === 1) fatal('GPU-Durchsatz fehlgeschlagen: ' + err);
+}
+
+// ── G7: Hybrid-Trainer — f32-Spiegel-Parität im Lockstep (M3c) ─
+// Zwei identische Trainer (seed 7, pop 8, 2 Beuten): A läuft auf dem
+// f64-CPU-Oracle, B auf der GPU inkl. mirrorInto()-Rückspiegelung. Dieselben
+// Genome, dieselben Sinne, dieselbe Steuerlogik — nur die Physik differs.
+// Headless-Vormessung (f32-Rundungs-Mock des CPU-Solvers): max Mantel-Δ
+// 0.0005 px, 0/900 Grip-Flag-Differenzen über 150 Schritte. Die Tore unten
+// lassen 1000× Luft bis zu dieser Marke — was darüber liegt, ist keine
+// Numerik, sondern ein Fehler (Race, Control-Pfad, Spiegel-Feld).
+say('\n--- G7 Hybrid-Trainer: Spiegel-Parität ---');
+{
+  const OPTS = { popSize: 8, stepsPerGen: 150, seed: 7, prey: 2 };
+  const STEPS = 150;
+  const A = createTrainer(OPTS);            // Oracle: reine CPU-Physik
+  const B = createTrainer(OPTS);            // Hybrid: GPU-Physik + Spiegel
+  const gpu = await create(B.sim.world, B.sim.map, wgsl, device);
+  const backend = gpuBackend(gpu);
+  beginGenerationGpu(A, null);
+  beginGenerationGpu(B, backend);
+  let maxD = 0, sumD = 0, gripMism = 0, gripTot = 0;
+  for (let s = 0; s < STEPS; s++) {
+    await gpuTrainStep(A, null);
+    await gpuTrainStep(B, backend);
+    for (let i = 0; i < OPTS.popSize; i++) {
+      const ca = A.sim.creatures[i], cb = B.sim.creatures[i];
+      const d = Math.hypot(ca.x - cb.x, ca.y - cb.y);
+      if (d > maxD) maxD = d;
+      sumD += d;
+      for (let a = 0; a < 6; a++) {
+        gripTot++;
+        if (ca.arms[a].grip.broken !== cb.arms[a].grip.broken) gripMism++;
+      }
+    }
+  }
+  const nanA = A.sim.world.stats.nan, nanB = B.sim.world.stats.nan;
+  const plA = A.sim.creatures.reduce((s, c) => s + c.pathLen, 0) / OPTS.popSize;
+  const plB = B.sim.creatures.reduce((s, c) => s + c.pathLen, 0) / OPTS.popSize;
+  verdict('G7 NaN', 'Lockstep 8 Tiere × 150 NN-Schritte, Beute aktiv', nanA, nanB, nanA === 0 && nanB === 0, false);
+  verdict('G7 max Δpos', `Größte Mantel-Abweichung über ${STEPS} Schritte (f32-Mock: 0.0005 px)`, 0, maxD, maxD < 0.5, '< 0.5 px');
+  verdict('G7 Grip-Flags', `Übereinstimmung der Saugnapf-Zustände (${gripTot} Vergleiche)`, 100, 100 * (1 - gripMism / gripTot), gripMism / gripTot < 0.01, '≥ 99 %');
+  verdict('G7 Pfadlänge', 'Ø zurückgelegter Weg — die Fitness-Rohgröße', plA, plB, Math.abs(plA - plB) < 0.05 * Math.max(plA, 1) + 1e-9, '±5 %');
+  say(`    mean Δpos: ${(sumD / (STEPS * OPTS.popSize)).toFixed(6)} px · Grip-Mismatches: ${gripMism}/${gripTot}`);
+  destroy(gpu);
+}
+
+// ── G8: Training auf der GPU — Durchsatz des Hybrid-Trainers ───
+// Erst Kalibrierung: derselbe Trainer, reine CPU-Physik (pop 32, 250 Schritte).
+// Dann echt: pop 256, 2 Generationen × 500 Schritte, Physik auf der GPU.
+// Gemeldet werden Tier-Schritte/s (= Tiere × Schritte / Wandzeit) — derselbe
+// Zähler wie G6, aber INKLUSIVE Sinne, Netz, ES und Spiegel-Overhead.
+// Erwartung aus Profil (Physik = 91.3 % der CPU-Kosten) und G6 (90.8×):
+// netto ~5–10×; das Tor ist bewusst konservativ auf 3× gesetzt.
+say('\n--- G8 Training auf GPU ---');
+{
+  const t0 = performance.now();
+  const trC = createTrainer({ popSize: 32, stepsPerGen: 250, seed: 11, prey: 0 });
+  beginGenerationGpu(trC, null);
+  for (let s = 0; s < 250; s++) await gpuTrainStep(trC, null);
+  endGeneration(trC);
+  const cpuRate = (32 * 250) / ((performance.now() - t0) / 1000);
+  say(`  CPU-Kalibrierung (pop 32, 250 Schritte): ${cpuRate.toFixed(0)} Tier-Schritte/s`);
+
+  const POP = 256, GENS = 2, STEPS = 500;
+  const trG = createTrainer({ popSize: POP, stepsPerGen: STEPS, seed: 11, prey: 0 });
+  const gpu = await create(trG.sim.world, trG.sim.map, wgsl, device);
+  const backend = gpuBackend(gpu);
+  const t1 = performance.now();
+  const hist = await runGpuTraining(trG, backend, GENS, STEPS, (r, g) => {
+    say(`  GPU-Gen ${g}: best ${r.best.toFixed(2)} mean ${r.mean.toFixed(2)} Anker ${(r.anchor * 100).toFixed(0)} % Zug ${r.gripPull.toFixed(0)} px Zyklen ${r.cycles.toFixed(2)}`);
+  });
+  const gpuMs = performance.now() - t1;
+  const gpuRate = (POP * GENS * STEPS) / (gpuMs / 1000);
+  const fac = gpuRate / cpuRate;
+  let finite = 0;
+  for (let i = 0; i < POP; i++) if (Number.isFinite(trG.fitness[i])) finite++;
+  verdict('G8 NaN/Fitness', `${POP} Tiere × ${GENS} Gen × ${STEPS} Schritte: Fitness endlich, Welt NaN-frei`, POP, trG.sim.world.stats.nan === 0 ? finite : 0, finite === POP && trG.sim.world.stats.nan === 0, false);
+  verdict('G8 Trainer-Durchsatz', 'Tier-Schritte/s inkl. Sinne+Netz+ES+Spiegeln (CPU-Basis: pop-32-Kalibrierung)', cpuRate, gpuRate, fac >= 3, '≥ 3×');
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td class="num">Trainer ${POP} (G8)</td><td class="num">${cpuRate.toFixed(0)}</td>` +
+    `<td class="num ok">${gpuRate.toFixed(0)}</td><td class="num ${fac >= 3 ? 'ok' : 'warn'}">${fac.toFixed(1)}×</td>`;
+  $('perf').querySelector('tbody').appendChild(tr);
+  say(`  Wandzeit GPU-Lauf: ${(gpuMs / 1000).toFixed(1)} s für ${POP * GENS} Episoden (${(gpuMs / (POP * GENS)).toFixed(1)} ms/Episode)`);
+  destroy(gpu);
 }
 
 // ── Fazit ─────────────────────────────────────────────────────

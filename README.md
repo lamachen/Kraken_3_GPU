@@ -58,8 +58,13 @@ src/physics/xpbd.js    XPBD-Solver, flache typisierte Arrays. CPU-Referenz = ORA
 src/world/map.js       Rechteckkarte + analytisches Signed-Distance-Field.
 src/body/kraken.js     Körpermodell: Mantel + 6 Arme × 7 Segmente, 1 Saugnapf/Arm.
 src/sim/core.js        DOM-freier Simulationskern: Zustand, Propriozeption, Steuerung.
+src/gpu/solver.wgsl    WGSL-Port des Solvers (Jacobi, f32, sequentielle Farb-Dispatches).
+src/gpu/gpuworld.js    Buffer/Bind-Groups, upload/packControls, step, download/mirrorInto.
+src/sim/gputrain.js    Hybrid-Trainer: Physik GPU, Sinne/Netz/ES CPU, Zustandsspiegel.
 src/render/            EINZIGE DOM-abhängige Schicht (view.js) + Platzhalter-Gang (demo.js).
-tools/harness.js       49 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
+tools/harness.js       53 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
+tools/profile-step.js  Zerlegt den Tier-Schritt in Phasen (µs) — Architektur-Entscheide.
+tools/mocktrain.js     Hybrid-Trainer headless ohne Device (Passthrough/f32-Mock).
 ```
 
 `src/physics`, `src/world`, `src/body` und `src/sim` enthalten **keine einzige
@@ -120,10 +125,14 @@ voll gestellt   (900 N Grenze)  → hält unter demselben Zug
 ## Abnahme: `node tools/harness.js`
 
 ```
-49/49 Checks bestanden
+53/53 Checks bestanden
   passiv        exakt in Ruhe            Pfad 0.00e+0 px        (v2: 964 px)
   slack-fixpoint Störung < slack         Δ = 0.00e+0 px, v = 0  (f32-Boden: GPU driftete 1.28 px)
   slack-corrects 25× slack korrigiert    0.050 px → 1.95e-3 px
+  mirror-fields GPU→CPU-Spiegel komplett 86 Körper, 180 Constraints, Grip-force = |λ|/h
+  pack-controls Steuer-Packing + Anker   lbx/lby-Sync für den Re-Grip mitten in der Episode
+  prey-determinism Beute aus Seed identisch (fix: makeEntity zog Math.random())
+  gputrain-identical Hybrid = CPU-Trainer Fitness bit-identisch, 2 Gen × 8 Tiere × 120 Schritte
   spawn         Pin-Verletzung 0         max 0.000e+0 px        (v2: 56.94 px)
   spawn-motor   Muskelziele = Spawn-Pose
   grip          verankerter Arm zieht    70.6 px = 72 %         (v2: 92…99 %)
@@ -229,7 +238,7 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
    dynamisch: Loslassen erfordert Adhäsion < 0.04 auf allen sechs Armen
    gleichzeitig, und danach müssen die Spitzen für den Re-Grip unter 150 px/s
    liegen — während der Körper gerade driftet.
-4. **[fertig: 3b, Validierung im Browser offen] GPU-Portierung.**
+4. **[fertig: 3b — 11/11 im Browser validiert] GPU-Portierung.**
    `src/gpu/solver.wgsl` ist ein 1:1-Port des CPU-Lösers (integrieren →
    Constraint-Iterationen → Kollision → Abschluss → Grip-Bruch), `src/gpu/gpuworld.js`
    die Bindings. **`gpu.html` fährt CPU und GPU auf identischen Eingaben im
@@ -252,10 +261,15 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
    — einschließlich der Totzone (`SLACK_POS`/`SLACK_ANG`, Werte UND Verwendung
    auf beiden Seiten).
 
-   **Messstand Browser-Validierung** (RTX 3070 Ti, Build `d487532`): **10/11**.
-   Sequenzieller Farb-Dispatch hatte G3 (Zugweg 70.33 CPU vs 70.36 GPU),
-   G5 (Determinismus, identische Hashes) und G1-maxV geheilt. Die zwei
-   verbleibenden Befunde, beide seitdem behoben:
+   **Messstand Browser-Validierung** (RTX 3070 Ti, Build `1d82d4e`): **11/11**.
+   G1 passiv 6.4e-5 px (< 0.05), Wachstum **0.0000** px, maxV **0.0000** px/s;
+   G2 Spawn-Verletzung 1e-4 px; G3 Zugweg 70.328 CPU vs. 70.339 GPU (0.015 %);
+   G4 Vollast 360.0001 px/s / 18.0 rad/s — die GPU fährt wirklich ans Limit
+   (vor der Control-Pfad-Korrektur: 0.1415 = Rauschboden, falsch-positiv);
+   G5 deterministisch, identische Hashes 429477292 unter Last;
+   G6 Durchsatz 0.3× (N=1) / 18.6× (N=64) / **90.8× (N=512) = 455 111
+   Kraken-Schritte/s**. Zwei Befunde aus der 10/11-Runde (`d487532`), beide
+   behoben und als Regression gepinnt:
 
    - **G1 Wachstum 1.2789 px** — kein Race, sondern die numerische Bodenhöhe
      von f32: ulp(position) ≈ 1.7e-4 px bei 1440-px-Koordinaten (G2 maß die
@@ -275,16 +289,71 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
      ≥ 80 % des CPU-Spitzenwerts — „nur unter Limit" besteht sonst auch
      im Stillstand. G5 lädt die Steuerung seitdem ebenfalls hoch
      (Determinismus unter Muskellast, nicht nur im Ruhezustand).
-4. **Gegner.** Bewohner-Agent im Trainings-Loop mit Lärm, Duftspur und Angriff.
+4. **[gebaut, Browser-Beweis offen: 3c] Hybrid-Trainer — Training auf der GPU.**
+   Profil zuerst (`tools/profile-step.js`, pop=32, µs pro Tier·Schritt):
+
+   | Phase | µs | Anteil |
+   |---|---|---|
+   | Physik (world.step) | 301.9 | **91.3 %** |
+   | Netz (forward+decode) | 13.7 | 4.1 % |
+   | Propriozeption | 6.2 | 1.9 % |
+   | Sinne nachführen (tickSenses) | 5.6 | 1.7 % |
+   | Rest (Steuerung, Messwerte, Welt) | 3.4 | 1.0 % |
+
+   → Die Physik wandert auf die GPU (90.8× gemessen), **Sinne/Netz/ES bleiben
+   auf der CPU** — sie sind zusammen keine 9 %. Architektur (`src/sim/gputrain.js`):
+   nach jedem GPU-Schritt spiegelt `mirrorInto()` den kompletten Zustand
+   (alle Körper px/py/vx/vy/ang/av, Constraint-λ, Grip-broken, Grip-force
+   = |λ|/h) in dieselbe CPU-Welt zurück. Dadurch laufen Propriozeption, Sinne,
+   **der Saugnapf-Reflex** und die Fitness UNVERÄNDERT — keine duplizierte
+   Logik, die auseinanderlaufen kann. `uploadControls()` synced jetzt auch
+   `lbx/lby`: ohne die würde ein mitten in der Episode neu verankerter Grip
+   auf der GPU am ALTEN Anker ziehen.
+
+   Zwei echte Bugs, die der Bau gefunden hat (beide als Check gepinnt):
+
+   - **`makeEntity()` zog `Math.random()`** für heading/seed der Beute —
+     zwei `createSim`-Aufrufe mit gleichem Seed waren verschieden. Mit prey=0
+     unsichtbar (M3a lief so), mit Beute wäre jede Messreihe nicht
+     reproduzierbar gewesen. Gefangen vom Passthrough-Check: Drift ab
+     Schritt 85, als die Beute vom deterministischen Fluchten ins Wandern
+     wechselte. Fix: Beute zieht aus `sim.rnd`; Check `prey-determinism`.
+   - **Constraint-Objekte waren polymorph**: `force` und `color` wurden erst
+     nachträglich angehängt → Grips und Motoren bekamen verschiedene Hidden
+     Classes, jeder Constraint-Loop lief langsam. Gemessen bei B=512
+     (46 080 Constraints): `mirrorInto` 9.27 → 3.5 ms, `packControls`
+     2.87 → 2.0 ms pro Schritt. Fix: beide Felder stehen in der Factory.
+
+   Headless-Beweise (ohne GPU-Device, `tools/mocktrain.js`):
+   `gputrain-identical` — Passthrough-Backend liefert **bit-identische**
+   Fitness zum CPU-Trainer (2 Gen × 8 Tiere × 120 Schritte, inkl. Aufruf-
+   Zähler); f32-Mock-Lauf (CPU-Physik + f32-Rundung des Spiegels, 8 Gen ×
+   32 Tiere × 500 Schritte) lernt durch die komplette Mirror-Pipeline:
+   **Anker 37 → 99 %, best 176.7 → 383.5, Zyklen 0.44 → 2.75** — dieselbe
+   Signatur wie M3a.
+
+   Browser-Beweise (gpu.html, noch zu fahren): **G7** Lockstep-Parität
+   (8 Tiere, 150 NN-Schritte, Tore aus der f32-Mock-Vormessung: max Δpos
+   0.0005 px → Tor 0.5 px; 0/900 Grip-Flag-Differenzen → Tor 99 %;
+   Pfadlänge ±5 %), **G8** Trainer-Durchsatz (pop 256, 2 Gen × 500 Schritte,
+   Tor ≥ 3× gegen die CPU-Kalibrierung; Erwartung aus Profil + G6: ~5–10×).
+
+   Bekannte Grenze (Hebel für 3d): der Readback ist die VOLLWelt
+   (4.6 MB/Schritt bei B=512, ~6–10 ms JS-Spiegel-Kosten) — ein kompakter
+   `stateOut`-Buffer (54 Floats/Tier statt 258+90/Tier) und gebatchtes NN
+   auf der GPU sind die nächsten Faktoren.
+5. **Gegner.** Bewohner-Agent im Trainings-Loop mit Lärm, Duftspur und Angriff.
    In v2 war die komplette gegenseitige Wahrnehmung gebaut, stand aber unter
    keinem Selektionsdruck: `stepPhysics` hatte null Referenzen auf den Spieler.
 
 ## Lokal
 
 ```bash
-node tools/harness.js          # 49 Abnahme-Checks
+node tools/harness.js          # 53 Abnahme-Checks
 node tools/check-wgsl.js       # Shader/Binding-Konsistenz (ohne GPU)
-node tools/trainrun.js --gens 20 --pop 32   # echter Trainingslauf (~90 s)
+node tools/trainrun.js --gens 20 --pop 32   # CPU-Trainingslauf (~90 s)
+node tools/profile-step.js 32 400           # Phasen-Profil des Tier-Schritts
+node tools/mocktrain.js --gens 8            # Hybrid-Trainer headless (f32-Mock)
 python3 -m http.server 8080    # oder: npx serve .   → http://localhost:8080
 ```
 

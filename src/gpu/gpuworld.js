@@ -227,8 +227,8 @@ export function upload(g) {
     g.consData[o + 6] = c.lbx; g.consData[o + 7] = c.lby;
     g.consData[o + 8] = c.compliance; g.consData[o + 9] = c.rest;
     g.consData[o + 10] = c.target; g.consData[o + 11] = c.minAngle;
-    g.consData[o + 12] = c.maxAngle; g.consData[o + 13] = c.lamX || 0;
-    g.consData[o + 14] = c.lamY || 0; g.consData[o + 15] = c.lambda;
+    g.consData[o + 12] = c.maxAngle; g.consData[o + 13] = c.lambdaX || 0;
+    g.consData[o + 14] = c.lambdaY || 0; g.consData[o + 15] = c.lambda;
     g.consData[o + 16] = Number.isFinite(c.breakForce) ? Math.min(c.breakForce, 1e30) : 1e30;
     consU[o + 17] = c.broken ? 1 : 0;                              // u32
     consU[o + 18] = 0; consU[o + 19] = 0;                          // pads
@@ -264,16 +264,34 @@ const disp = (n) => Math.ceil(n / WORKGROUP);
  * Ganzzahlen (broken) über die Uint32-Sicht, siehe d24df09.
  */
 export function uploadControls(g) {
-  const { cpu } = g;
-  const consU = new Uint32Array(g.consData.buffer);
+  packControls(g.cpu, g.consData);
+  g.device.queue.writeBuffer(g.buffers.cons, 0, g.consData);
+}
+
+/**
+ * Steuerrelevante Constraint-Felder aus der CPU-Welt in den flachen Block
+ * packen — reine Funktion, damit tools/harness.js das Packing ohne Device
+ * prüfen kann (mirror-into-/pack-controls-Checks).
+ *
+ * Felder: compliance (o+8), tgt (o+10), lbx/lby (o+6/7), breakForce (o+16),
+ * broken (o+17, ÜBER DIE UINT32-SICHT — d24df09: Ganzzahlen nie durch die
+ * Float-Sicht schreiben).
+ *
+ * lbx/lby SIND PFLICHT: Der Saugnapf-Reflex (applyControl) verankert die
+ * Spitze mitten in der Episode NEU — attachGrip schreibt lbx/lby auf die
+ * aktuelle Spitzenposition. Ohne Sync würde die GPU mit dem Anker aus dem
+ * letzten vollen upload() ziehen (Spawn-Position oder 0/0).
+ */
+export function packControls(cpu, consData) {
+  const consU = new Uint32Array(consData.buffer, consData.byteOffset, consData.length);
   for (let k = 0; k < cpu.constraints.length; k++) {
     const c = cpu.constraints[k], o = k * CONS_STRIDE;
-    g.consData[o + 8] = c.compliance;
-    g.consData[o + 10] = c.target;
-    g.consData[o + 16] = Number.isFinite(c.breakForce) ? Math.min(c.breakForce, 1e30) : 1e30;
+    consData[o + 6] = c.lbx; consData[o + 7] = c.lby;
+    consData[o + 8] = c.compliance;
+    consData[o + 10] = c.target;
+    consData[o + 16] = Number.isFinite(c.breakForce) ? Math.min(c.breakForce, 1e30) : 1e30;
     consU[o + 17] = c.broken ? 1 : 0;
   }
-  g.device.queue.writeBuffer(g.buffers.cons, 0, g.consData);
 }
 
 /** Ein Substep — dieselbe Reihenfolge wie XpbdWorld.substep(). */
@@ -328,24 +346,62 @@ export async function download(g) {
   const bd = new Float32Array(g.buffers.readBodies.getMappedRange().slice(0));
   const cd = new Float32Array(g.buffers.readCons.getMappedRange().slice(0));
   g.buffers.readBodies.unmap(); g.buffers.readCons.unmap();
+  return mirrorInto(g.cpu, bd, cd);
+}
 
-  const cpu = g.cpu;
-  let maxSpeed = 0, maxAngSpeed = 0, nan = 0;
+/**
+ * Spiegelung des GPU-Zustands in die CPU-Welt — reine Funktion (ohne Device),
+ * damit tools/harness.js das Feld-Mapping exakt pinnen kann.
+ *
+ * Das ist das Fundament des Hybrid-Trainings (Milestone 3c): Nach der
+ * Spiegelung laufen readProprio/tickSenses/applyControl (inkl. Saugnapf-
+ * Reflex)/postStep UNVERÄNDERT auf der CPU — dieselben Code-Pfade wie im
+ * CPU-Trainer, nur dass die Physik von der GPU kam. Keine Sinn-Logik wird
+ * dupliziert, die CPU bleibt das Oracle.
+ *
+ * Gespiegelt werden: px, py, vx, vy, ang, av (alle Körper), lambda (Motoren),
+ * lambdaX/lambdaY + broken + force (Grips). NICHT gespiegelt: ppx/ppy/angP
+ * (liest kein CPU-Verbraucher; respawnCreature setzt sie vor dem nächsten
+ * upload() selbst) und stats.broken (Zähler, kein Zustand).
+ *
+ * Grip-force: Parität zu _postGripBreak() in xpbd.js — F = |λ|/h. Die GPU
+ * nullt λ beim Bruch (gripBreak), CPU behält den Wert; beobachtbar ist das
+ * nicht, denn readProprio gibt für gebrochene Grips ohnehin 0 aus.
+ */
+export function mirrorInto(cpu, bodyData, consData) {
+  const consU = new Uint32Array(consData.buffer, consData.byteOffset, consData.length);
+  // Enger Loop ohne Allokationen: die frühere Fassung baute pro Körper ein
+  // 5er-Array für .every(Number.isFinite) und nutzte Math.hypot für die
+  // Statistik — 22 016 Körper × (Allokation + hypot) kostete ~5.8 ms/Schritt
+  // bei B=512. Stats sind Diagnosewerte (G1-Tor: < 0.05 px/s), deshalb ist
+  // sqrt(vx²+vy²) statt hypot hier statthaft; die Grip-KRAFT bleibt exakt
+  // Math.hypot — sie ist Parität zu _postGripBreak() und NN-Eingang.
+  let maxS2 = 0, maxAngSpeed = 0, nan = 0;
   for (let i = 0; i < cpu.n; i++) {
     const o = i * BODY_STRIDE;
-    cpu.px[i] = bd[o]; cpu.py[i] = bd[o + 1];
-    cpu.vx[i] = bd[o + 4]; cpu.vy[i] = bd[o + 5];
-    cpu.ang[i] = bd[o + 6]; cpu.av[i] = bd[o + 8];
-    const s = Math.hypot(cpu.vx[i], cpu.vy[i]);
-    if (s > maxSpeed) maxSpeed = s;
-    const a = Math.abs(cpu.av[i]);
-    if (a > maxAngSpeed) maxAngSpeed = a;
-    if (![cpu.px[i], cpu.py[i], cpu.vx[i], cpu.vy[i], cpu.ang[i]].every(Number.isFinite)) nan++;
+    const px = bodyData[o], py = bodyData[o + 1];
+    const vx = bodyData[o + 4], vy = bodyData[o + 5];
+    const ang = bodyData[o + 6], av = bodyData[o + 8];
+    cpu.px[i] = px; cpu.py[i] = py;
+    cpu.vx[i] = vx; cpu.vy[i] = vy;
+    cpu.ang[i] = ang; cpu.av[i] = av;
+    const s2 = vx * vx + vy * vy;
+    if (s2 > maxS2) maxS2 = s2;
+    const aa = av < 0 ? -av : av;
+    if (aa > maxAngSpeed) maxAngSpeed = aa;
+    if (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(vx)
+      || !Number.isFinite(vy) || !Number.isFinite(ang)) nan++;
   }
+  const maxSpeed = Math.sqrt(maxS2);
+  const invH = 1 / cpu.h;
   for (let k = 0; k < cpu.constraints.length; k++) {
     const c = cpu.constraints[k], o = k * CONS_STRIDE;
-    c.lamX = cd[o + 13]; c.lamY = cd[o + 14]; c.lambda = cd[o + 15];
-    c.broken = cd[o + 17] !== 0;
+    c.lambda = consData[o + 15];
+    c.broken = consU[o + 17] !== 0;
+    if (c.type === 2) {                    // C_GRIP — Parität zu xpbd.js
+      c.lambdaX = consData[o + 13]; c.lambdaY = consData[o + 14];
+      c.force = Math.hypot(c.lambdaX, c.lambdaY) * invH;
+    }
   }
   cpu.stats.maxSpeed = maxSpeed;
   cpu.stats.maxAngSpeed = maxAngSpeed;

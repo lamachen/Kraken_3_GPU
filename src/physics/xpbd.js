@@ -109,7 +109,7 @@ export function ensureColored(world) {
   if (world.colorOff) return world.colorOff;
   const mask = new Uint32Array(Math.max(1024, world.n * 2));
   for (const c of world.constraints) {
-    if (c.color === undefined) c.color = assignColor(mask, c.a, c.b >= 0 ? c.b : -1);
+    if (c.color < 0) c.color = assignColor(mask, c.a, c.b >= 0 ? c.b : -1);
   }
   const buckets = Array.from({ length: MAX_COLORS }, () => []);
   for (const c of world.constraints) buckets[c.color | 0].push(c);
@@ -163,10 +163,18 @@ export function makeConstraint(type, a, b, lax, lay, lbx, lby, compliance = 0) {
     lambda: 0, lambdaX: 0, lambdaY: 0,   // akkumuliert pro Substep
     broken: false,
     breakForce: Infinity,                 // für C_GRIP: Adhäsionsgrenze in N
+    force: 0,                             // für C_GRIP: gemessene Zugkraft F = |λ|/h
     target: 0,                            // für C_ANGLE: kommandierte ABWEICHUNG von rest
     rest: 0,                              // für C_ANGLE: Ruhe-Richtung des Gelenks
     minAngle: -Infinity, maxAngle: Infinity,
     owner: -1,                            // Index des Arms, für Sensorik
+    // ALLE Felder, die irgendwo später gesetzt werden, müssen hier stehen:
+    // nachträglich angehängte Properties (früher: force, color) gaben Grips
+    // eine andere Hidden Class als Motoren — jeder Constraint-Loop (Solver,
+    // mirrorInto, packControls, _postGripBreak) lief polymorph. Gemessen bei
+    // B=512 (22 016 Körper, 46 080 Constraints): mirrorInto 9.27 ms,
+    // packControls 2.87 ms pro Schritt — fast so viel wie Sinne+Netz (14.8 ms).
+    color: -1,                            // Farbklasse für den GPU-Dispatch (< 0 = ungefärbt)
   };
 }
 

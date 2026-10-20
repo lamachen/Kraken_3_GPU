@@ -44,6 +44,7 @@ jobs:
           test -f site/gpu-min.html || (echo "::error::gpu-min.html fehlt" && exit 1)
           test -f site/src/gpu/solver.wgsl || (echo "::error::Shader fehlt" && exit 1)
           test -f site/src/sim/core.js || (echo "::error::src/sim/core.js fehlt" && exit 1)
+          test -f site/src/sim/gputrain.js || (echo "::error::src/sim/gputrain.js fehlt" && exit 1)
           test -f site/.nojekyll || touch site/.nojekyll
           echo "Site-Inhalt:"; find site -type f | sort
       - name: Cache-Busting (eindeutige Modul-URLs pro Deploy)

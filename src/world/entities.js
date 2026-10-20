@@ -23,6 +23,12 @@ export const KIND_PREY = 0;
 export const KIND_INTRUDER = 1;
 
 export function makeEntity(kind, x, y, opts = {}) {
+  // Determinismus: heading/seed MÜSSEN aus einem benannten RNG kommen. Mit
+  // Math.random() waren zwei createSim-Aufrufe mit gleichem Seed verschieden
+  // (gefangen vom gputrain-passthrough-Check: Beute driftete ab Schritt 85,
+  // sobald sie vom deterministischen Flucht- ins Zufalls-Wandern wechselte).
+  // Der Math.random-Fallback bleibt nur für Aufrufer ohne Sim-Kontext.
+  const r = opts.rnd || Math.random;
   return {
     kind,
     x, y, vx: 0, vy: 0,
@@ -33,9 +39,9 @@ export function makeEntity(kind, x, y, opts = {}) {
     noise: 0,
     emitsLight: !!opts.emitsLight,
     lightRadius: opts.lightRadius || 0,
-    seed: Math.random() * 100,
+    seed: r() * 100,
     wanderT: 0,
-    heading: Math.random() * Math.PI * 2,
+    heading: r() * Math.PI * 2,
     alive: true,
   };
 }
