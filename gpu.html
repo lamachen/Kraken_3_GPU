@@ -94,8 +94,12 @@ function fatal(msg) {
 }
 
 // ── Umgebung ──────────────────────────────────────────────────
-envRow('WebGPU verfügbar', isAvailable() ? 'ja' : 'NEIN', isAvailable() ? 'ok' : 'bad');
-envRow('navigator.gpu', typeof navigator.gpu !== 'undefined' ? 'vorhanden' : 'fehlt');
+// WICHTIG — zwei verschiedene Schichten, die nichts übereinander aussagen:
+//   navigator.gpu          = die JS-API ist im Browser vorhanden (Objekt-Check)
+//   requestAdapter() != null = der Treiber gibt einen nutzbaren Adapter her
+// Die alte Zeile hieß "WebGPU verfügbar: ja" und suggerierte Hardware, wo nur
+// eine API-Schnittstelle geprüft wurde. Genau das hat zu Recht verwirrt.
+envRow('WebGPU-API (navigator.gpu)', isAvailable() ? 'vorhanden — sagt NICHTS über einen nutzbaren Adapter' : 'FEHLT', isAvailable() ? 'ok' : 'bad');
 envRow('User Agent', navigator.userAgent.slice(0, 90), 'dim');
 if (!isAvailable()) {
   fatal('Dieser Browser stellt kein navigator.gpu bereit. Chrome/Edge ab 113, Safari ab 26, Firefox ab 141/145.');
@@ -105,14 +109,43 @@ if (!isAvailable()) {
 let adapter, device, wgsl;
 try {
   say('Adapter wird angefordert…');
-  adapter = await navigator.gpu.requestAdapter();
-  if (!adapter) throw new Error(
-    'requestAdapter() lieferte null. Das heißt NICHT zwingend, dass die GPU fehlt: ' +
-    'der GPU-Prozess kann überlastet oder gecrasht sein (viele WebGPU-Devices, ' +
-    'Treiber-Reset, Tab im Hintergrund, Energiesparmodus). ' +
-    'Seite mit Strg+Shift+R neu laden. Bleibt es: chrome://gpu öffnen und prüfen, ' +
-    'ob "WebGPU" als enabled gelistet ist.');
-  envRow('Adapter', adapter.isFallbackAdapter ? 'Fallback (WARP/Software)' : 'Hardware', adapter.isFallbackAdapter ? 'warn' : 'ok');
+  // Drei Varianten probieren und JEDE Antwort protokollieren. Ein null auf der
+  // Standard-Anfrage heißt nicht, dass alle Anfragen null liefern — und umgekehrt
+  // sagt ein erfolgreicher low-power/fallback-Adapter, dass der Hardware-Pfad
+  // blockiert ist. Das ist die Information, die man für die Diagnose braucht.
+  const probes = [
+    ['Standard', undefined],
+    ['low-power', { powerPreference: 'low-power' }],
+    ['high-performance', { powerPreference: 'high-performance' }],
+    ['forceFallbackAdapter', { forceFallbackAdapter: true }],
+  ];
+  let usedVariant = null;
+  for (const [label, opts] of probes) {
+    let a = null;
+    try { a = await navigator.gpu.requestAdapter(opts); } catch (e) { a = null; say('  Probe ' + label + ': geworfen — ' + e.message); }
+    say('  Probe ' + label.padEnd(20) + ' → ' + (a ? (a.isFallbackAdapter ? 'Fallback-Adapter' : 'Hardware-Adapter') : 'null'));
+    if (a && !adapter) { adapter = a; usedVariant = label; }
+  }
+  if (!adapter) {
+    // Ein gecrashter GPU-Prozess überlebt einen Seiten-Reload. Das ist der
+    // häufigste Grund für null-auf-allererster-Anfrage bei einer Maschine, die
+    // kurz zuvor noch Hardware gemeldet hat.
+    throw new Error(
+      'Alle vier Adapter-Anfragen lieferten null, obwohl navigator.gpu vorhanden ist.\n\n' +
+      'Wahrscheinlichste Ursache: der GPU-Prozess des Browsers ist gecrasht oder ' +
+      'blockiert — und dieser Zustand ÜBERLEBT EINEN SEITEN-RELOAD.\n\n' +
+      '  1. Chrome KOMPLETT schließen (alle Fenster, alle Tabs) und neu starten.\n'
+      + '  2. Diese Seite mit Strg+Shift+R neu laden.\n' +
+      '  3. Bleibt es: chrome://gpu öffnen und nach "WebGPU" suchen — steht dort\n' +
+      '     "Disabled" oder "Software only", ist der Treiber auf der Blockliste.\n' +
+      '  4. Windows: NVIDIA-Treiber aktualisieren; Energiespar-/Akkumodus testweise aus.\n\n' +
+      'Hintergrund: eine frühere Version dieser Seite legte pro Szenario ein eigenes ' +
+      'WebGPU-Device an und gab es nie frei. Das kann den GPU-Prozess crashen — ' +
+      'der Leak ist behoben (Commit 5b9c03d), aber ein bereits gecrashter Prozess ' +
+      'erholt sich erst mit einem Browser-Neustart.');
+  }
+  envRow('Adapter', (adapter.isFallbackAdapter ? 'Fallback (WARP/Software)' : 'Hardware') + '  ·  Anfrage-Variante: ' + usedVariant,
+    adapter.isFallbackAdapter ? 'warn' : 'ok');
   const info = adapter.info || {};
   if (info.vendor || info.architecture) envRow('Adapter-Info', `${info.vendor || ''} ${info.architecture || ''} ${info.description || ''}`.trim(), 'dim');
   device = await adapter.requestDevice();
