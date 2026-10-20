@@ -56,7 +56,7 @@ import { XpbdWorld } from './src/physics/xpbd.js';
 import { makeMap, mulberry32, findSpawn } from './src/world/map.js';
 import { spawnKraken, tipPosition, attachGrip, adhesionToBreakForce, BODY, ARM_REACH } from './src/body/kraken.js';
 import { toneToCompliance } from './src/body/kraken.js';
-import { isAvailable, create, upload, step, download, destroy, loadWgsl } from './src/gpu/gpuworld.js';
+import { isAvailable, create, upload, uploadControls, step, download, destroy, loadWgsl } from './src/gpu/gpuworld.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
@@ -205,10 +205,24 @@ say('\n--- G1 passives Gleichgewicht ---');
     cpuPath += Math.hypot(a.world.px[m] - a.krakens[ci].spawn.x, a.world.py[m] - a.krakens[ci].spawn.y);
     gpuPath += Math.hypot(b.world.px[m2] - b.krakens[ci].spawn.x, b.world.py[m2] - b.krakens[ci].spawn.y);
   }
-  verdict('G1 passiv', 'Verschiebung ohne jeden Antrieb, 240 Schritte (Soll: exakt 0)', cpuPath, gpuPath,
-    cpuPath === 0 && gpuPath === 0, false);
-  verdict('G1 maxV', 'Spitzengeschwindigkeit', a.world.stats.maxSpeed, gs.maxSpeed,
-    a.world.stats.maxSpeed === 0 && gs.maxSpeed === 0, false);
+  // CPU rechnet Float64, GPU Float32: ein driftfreies System ist auf f32 nicht
+  // bit-exakt null (Positionsrundung bei ~1000 px Koordinaten ~6e-5). Deshalb
+  // absolute Schwelle plus WACHSTUMStest über 9x die Zeit: echte Energie-
+  // injektion (Kraken_v2: 964 px!) wächst linear, ein Rundungsrest nicht.
+  for (let i = 0; i < 2160; i++) { a.world.step(); }
+  for (let i = 0; i < 2160; i++) { await step(gpu); }
+  const gs2 = await download(gpu);
+  let cpuPath2 = 0, gpuPath2 = 0;
+  for (let ci2 = 0; ci2 < a.krakens.length; ci2++) {
+    const m = a.krakens[ci2].mantle, m2 = b.krakens[ci2].mantle;
+    cpuPath2 += Math.hypot(a.world.px[m] - a.krakens[ci2].spawn.x, a.world.py[m] - a.krakens[ci2].spawn.y);
+    gpuPath2 += Math.hypot(b.world.px[m2] - b.krakens[ci2].spawn.x, b.world.py[m2] - b.krakens[ci2].spawn.y);
+  }
+  const grew = gpuPath2 - gpuPath;
+  verdict('G1 passiv', 'Verschiebung ohne Antrieb, 240 Schritte (f32-Boden, Soll ≈0)', cpuPath, gpuPath, gpuPath < 0.05, '< 0.05 px');
+  verdict('G1 Wachstum', '+2160 Schritte: Drift wächst NICHT linear (Energie-Injektion?)', grew, grew, grew < 0.05, '< 0.05 px');
+  say('    (Kraken_v2 auf matter-js lieferte im selben Test 964 px — als Referenzmarke)');
+  verdict('G1 maxV', 'Spitzengeschwindigkeit (f32-Boden)', a.world.stats.maxSpeed, gs2.maxSpeed, gs2.maxSpeed < 0.5, '< 0.5 px/s');
   verdict('G1 NaN', 'NaN-Körper', a.world.stats.nan, gs.nan, gs.nan === 0, false);
   destroy(gpu);
 }
@@ -222,7 +236,8 @@ say('\n--- G2 Spawn-Verletzung ---');
   const viol = (w) => {
     let worst = 0;
     for (const c of w.constraints) {
-      if (c.type !== 0 && c.type !== 2) continue;
+      if (c.type !== 0) continue;        // nur PINs: Grips starten broken mit der
+      if (c.broken) continue;            // Spawn-Position als Platzhalter-Anker
       const A = c.a, B = c.b;
       const ca = Math.cos(w.ang[A]), sa = Math.sin(w.ang[A]);
       const gax = w.px[A] + c.lax * ca - c.lay * sa, gay = w.py[A] + c.lax * sa + c.lay * ca;
@@ -259,7 +274,7 @@ say('\n--- G3 grip-and-pull (Toleranz-Vergleich) ---');
       for (let j = 1; j < arm.motors.length; j++) arm.motors[j].target = BODY.jointLimit * 0.98;
       for (let a = 1; a < k.arms.length; a++) for (const m of k.arms[a].motors) { m.compliance = toneToCompliance(0.2); m.target = 0; }
       arm.grip.breakForce = adhesionToBreakForce(1.0);
-      if (useGpu) { await step(gpu); await download(gpu); } else { w.step(); }
+      if (useGpu) { uploadControls(gpu); await step(gpu); await download(gpu); } else { w.step(); }
       if (arm.grip.broken) break;
       const d = Math.hypot(w.px[k.mantle] - anchor.x, w.py[k.mantle] - anchor.y);
       if (d < minD) minD = d;
@@ -295,6 +310,7 @@ say('\n--- G4 Grenzen unter Vollast ---');
     cpuPeakV = Math.max(cpuPeakV, a.world.stats.maxSpeed);
     cpuPeakA = Math.max(cpuPeakA, a.world.stats.maxAngSpeed);
     cpuNaN += a.world.stats.nan;
+    uploadControls(gpu);
     await step(gpu);
     const gs = await download(gpu);
     gpuPeakV = Math.max(gpuPeakV, gs.maxSpeed); gpuPeakA = Math.max(gpuPeakA, gs.maxAngSpeed); gpuNaN += gs.nan;

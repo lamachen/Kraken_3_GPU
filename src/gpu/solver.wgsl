@@ -59,6 +59,13 @@ struct Rect  { x: f32, y: f32, w: f32, h: f32 };
 @group(0) @binding(3) var<storage, read_write> collPts: array<CollPt>;
 @group(0) @binding(4) var<storage, read> rects: array<Rect>;
 @group(0) @binding(5) var<storage, read_write> forces: array<vec4f>;   // fx, fy, torque, adhesion
+// [0..15]  Start-Offset jeder Farbgruppe im Constraint-Array
+// [16..31] Anzahl Constraints pro Farbe
+// [32]     Workgroups pro Farbe = ceil(maxCnt/64)
+// EIN Dispatch deckt alle 16 Farben ab: Thread-Id -> Farbe -> Offset.
+// Innerhalb einer Farbe teilt kein Körper zwei Constraints, also kein
+// Schreib-Race ohne Atomics. Kein pro-Dispatch-Uniform-Update nötig.
+@group(0) @binding(6) var<storage, read> colorInfo: array<u32>;
 
 const TAU: f32 = 6.28318530718;
 
@@ -160,8 +167,12 @@ fn integrate(@builtin(global_invocation_id) gid: vec3u) {
 // ══ 2a. Constraints (Pin / Winkel / Grip) ═════════════════════════
 @compute @workgroup_size(64)
 fn solveConstraints(@builtin(global_invocation_id) gid: vec3u) {
-  let k = gid.x;
-  if (k >= P.nConstraints) { return; }
+  let threadsPerColor = colorInfo[32] * 64u;
+  let color = gid.x / threadsPerColor;
+  let local = gid.x % threadsPerColor;
+  if (color >= 16u) { return; }
+  if (local >= colorInfo[16 + color]) { return; }
+  let k = colorInfo[color] + local;
   var c = cons[k];
   if (c.broken != 0u) { return; }
   if (c.cType == 1u) { solveAngle(k); return; }

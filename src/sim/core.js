@@ -8,7 +8,7 @@
  */
 import { XpbdWorld } from '../physics/xpbd.js';
 import { makeMap, findSpawn, mulberry32, tickMapLights } from '../world/map.js';
-import { spawnKraken, tipPosition, attachGrip, releaseGrip, armCurl, armExtension, toneToCompliance, adhesionToBreakForce, BODY, ARM_REACH } from '../body/kraken.js';
+import { spawnKraken, tipPosition, attachGrip, releaseGrip, armCurl, armExtension, toneToCompliance, adhesionToBreakForce, BODY, ARM_REACH, assignColor, MAX_COLORS } from '../body/kraken.js';
 import { makeEntity, tickEntity, KIND_PREY } from '../world/entities.js';
 import { measureReach } from './fitness.js';
 import { createEcho, emit as emitEcho, tick as tickEcho, write as writeEcho, ECHO_DIM } from '../senses/echo.js';
@@ -42,11 +42,20 @@ export function createSim(opts = {}) {
   const rnd = mulberry32(o.seed ^ 0x9e3779b9);
 
   const creatures = [];
+  const colorMask = new Uint32Array(1 << 16);   // Inzidenz-Bitmasken pro Körper
   for (let i = 0; i < o.creatures; i++) {
     // Clearance MUSS größer als die Armreichweite sein (118.5 px), sonst spawnen
     // die Arme in Wänden und die Kollisionsprojektion katapultiert sie heraus.
     const sp = findSpawn(map, ARM_REACH + 20, rnd);
     const k = spawnKraken(world, sp.x, sp.y, rnd() * Math.PI * 2);
+    // Constraints dieses Tieres färben (Indices sind global, Maske wächst mit)
+    const seen = new Set();
+    const all = [...world.constraints, ...k.arms.flatMap(a => a.motors), ...k.arms.map(a => a.grip)];
+    for (const c of all) {
+      if (seen.has(c)) continue;
+      seen.add(c);
+      if (c.color === undefined) c.color = assignColor(colorMask, c.a, c.b >= 0 ? c.b : -1);
+    }
     const cr = makeCreature(world, k, map, o, i);
     // Verfügbaren Freiraum beim Spawn vermessen — ohne das ist die Fitness
     // reine Lotterie (wer in einer Nische spawnt, kann nie weit kommen).
@@ -60,6 +69,7 @@ export function createSim(opts = {}) {
     const sp = findSpawn(map, 40, rnd);
     entities.push(makeEntity(KIND_PREY, sp.x, sp.y, { scent: 1.0, speed: o.preySpeed }));
   }
+  groupConstraintsByColor(world);
   return { world, map, creatures, entities, opts: o, rnd, time: 0, stepCount: 0 };
 }
 
@@ -254,6 +264,26 @@ export function tickSenses(c, sim) {
   }
 }
 
+
+/**
+ * Constraints stabil nach Farbe umsortieren, Offsets merken.
+ * Objektidentität bleibt (Arme halten Referenzen); nur die Array-Reihenfolge
+ * ändert sich. CPU und GPU sehen dadurch dieselbe Reihenfolge, und die GPU
+ * fährt pro Farbe einen race-freien Dispatch.
+ */
+export function groupConstraintsByColor(world) {
+  const buckets = Array.from({ length: MAX_COLORS }, () => []);
+  for (const c of world.constraints) buckets[c.color | 0].push(c);
+  const off = new Uint32Array(MAX_COLORS), cnt = new Uint32Array(MAX_COLORS);
+  let n = 0, maxCnt = 0;
+  for (let c = 0; c < MAX_COLORS; c++) {
+    off[c] = n; cnt[c] = buckets[c].length;
+    if (cnt[c] > maxCnt) maxCnt = cnt[c];
+    n += cnt[c];
+  }
+  world.constraints = buckets.flat();
+  world.colorOff = off; world.colorCnt = cnt; world.colorMax = maxCnt;
+}
 
 /** Messwerte VOR dem Physik-Schritt sichern. */
 export function preStep(c) {

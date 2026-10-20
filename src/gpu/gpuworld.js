@@ -68,6 +68,7 @@ export async function create(cpu, map, wgslSource, device) {
     collPts: buf(nP * 4 * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
     rects: buf(nR * 4 * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
     forces: buf(nB * 4 * 4, SS),
+    colorInfo: buf(33 * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
     readBodies: buf(nB * BODY_STRIDE * 4, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ),
     readCons: buf(nC * CONS_STRIDE * 4, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ),
   };
@@ -90,6 +91,7 @@ export async function create(cpu, map, wgslSource, device) {
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     ],
   });
   const pipelineLayout = device.createBindGroupLayout ? device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }) : null;
@@ -110,6 +112,7 @@ export async function create(cpu, map, wgslSource, device) {
       { binding: 3, resource: { buffer: buffers.collPts } },
       { binding: 4, resource: { buffer: buffers.rects } },
       { binding: 5, resource: { buffer: buffers.forces } },
+      { binding: 6, resource: { buffer: buffers.colorInfo } },
     ],
   });
 
@@ -212,9 +215,45 @@ export function upload(g) {
   g.device.queue.writeBuffer(g.buffers.bodies, 0, g.bodyData);
   g.device.queue.writeBuffer(g.buffers.cons, 0, g.consData);
   g.device.queue.writeBuffer(g.buffers.forces, 0, g.forceData);
+
+  // Farbgruppen: Offsets, Anzahlen, Workgroups pro Farbe.
+  // Ganzzahlen MÜSSEN über die Uint32-Sicht — derselbe Fehlerklassen-Fix wie
+  // d24df09 (Float-Bitmuster in u32-Feldern ließ das Device hängen).
+  const ci = new Uint32Array(33);
+  let maxCnt = 0;
+  for (let c = 0; c < 16; c++) {
+    ci[c] = cpu.colorOff[c]; ci[16 + c] = cpu.colorCnt[c];
+    if (cpu.colorCnt[c] > maxCnt) maxCnt = cpu.colorCnt[c];
+  }
+  ci[32] = Math.max(1, Math.ceil(maxCnt / 64));
+  g.colorWG = ci[32];
+  g.device.queue.writeBuffer(g.buffers.colorInfo, 0, ci);
 }
 
 const disp = (n) => Math.ceil(n / WORKGROUP);
+
+/**
+ * Nur die veränderlichen Constraint-Felder neu schreiben (compliance, target,
+ * breakForce, broken). upload() würde die Körperzustände aus den CPU-Arrays
+ * zurückschreiben und damit den GPU-Fortschritt vernichten.
+ *
+ * Ohne das sahen G3/G4 auf der GPU ewig die Spawn-Ziele: die Tests änderten
+ * Muskelziele pro Schritt auf der CPU, luden sie aber nie hoch — die GPU
+ * simulierte folgerichtig ein Tier im Gleichgewicht (G4 maxV 0.132 statt 360).
+ * Ganzzahlen (broken) über die Uint32-Sicht, siehe d24df09.
+ */
+export function uploadControls(g) {
+  const { cpu } = g;
+  const consU = new Uint32Array(g.consData.buffer);
+  for (let k = 0; k < cpu.constraints.length; k++) {
+    const c = cpu.constraints[k], o = k * CONS_STRIDE;
+    g.consData[o + 8] = c.compliance;
+    g.consData[o + 10] = c.target;
+    g.consData[o + 16] = Number.isFinite(c.breakForce) ? Math.min(c.breakForce, 1e30) : 1e30;
+    consU[o + 17] = c.broken ? 1 : 0;
+  }
+  g.device.queue.writeBuffer(g.buffers.cons, 0, g.consData);
+}
 
 /** Ein Substep — dieselbe Reihenfolge wie XpbdWorld.substep(). */
 export function substep(g) {
@@ -227,7 +266,9 @@ export function substep(g) {
   for (let it = 0; it < g.cpu.iterations; it++) {
     p = pass();
     p.setPipeline(g.pipelines.solveConstraints); p.setBindGroup(0, g.bindGroup);
-    p.dispatchWorkgroups(disp(g.nC));
+    // 16 Farben × Workgroups pro Farbe; Threads außerhalb einer Farbgruppe
+    // kehren sofort zurück (siehe solveConstraints).
+    p.dispatchWorkgroups(16 * g.colorWG);
     p.setPipeline(g.pipelines.solveCollisions); p.setBindGroup(0, g.bindGroup);
     p.dispatchWorkgroups(disp(g.nP));
     p.end();
