@@ -116,7 +116,14 @@ export async function create(cpu, map, wgslSource, device) {
   const g = {
     device, buffers, pipelines, bindGroup, warnings,
     cpu, map, nB, nC, nP, nR,
-    params: new Float32Array(16),
+    // ALLE Felder sind 4 Byte, daher ist der Element-Index für Float32-,
+    // Int32- und Uint32-Sicht derselbe. Ganzzahlen MÜSSEN über die Int-Sicht
+    // geschrieben werden: ein Float32Array speichert das Bitmuster von 4.0
+    // (0x40800000), und der Shader liest daraus als i32 = 1.082.130.432.
+    // Genau das hat die GPU hängen lassen (DXGI_ERROR_DEVICE_HUNG, TDR-Reset),
+    // weil die SDF-Schleife dann milliardenfach lief.
+    paramsF: new Float32Array(16),
+    paramsI: null, paramsU: null,
     bodyData: new Float32Array(nB * BODY_STRIDE),
     consData: new Float32Array(nC * CONS_STRIDE),
     collData: new Float32Array(nP * 4),
@@ -124,25 +131,34 @@ export async function create(cpu, map, wgslSource, device) {
     forceData: new Float32Array(nB * 4),
     dispatches: 0,
   };
+  g.paramsI = new Int32Array(g.paramsF.buffer);
+  g.paramsU = new Uint32Array(g.paramsF.buffer);
   writeStatic(g);
   return g;
 }
 
 function writeStatic(g) {
   const { cpu, map } = g;
-  g.params[0] = cpu.h;
-  g.params[1] = cpu.iterations;
-  g.params[2] = cpu.linDrag;
-  g.params[3] = cpu.angDrag;
-  g.params[4] = cpu.maxSpeed;
-  g.params[5] = cpu.maxAngSpeed;
-  g.params[6] = cpu.n;
-  g.params[7] = cpu.constraints.length;
-  g.params[8] = cpu.collPts.length;
-  g.params[9] = map.rects.length;
-  g.params[10] = 1 / cpu.h;
-  g.params[11] = 1 / (cpu.h * cpu.h);
-  g.device.queue.writeBuffer(g.buffers.params, 0, g.params);
+  const F = g.paramsF, I = g.paramsI, U = g.paramsU;
+  F[0] = cpu.h;
+  I[1] = cpu.iterations;                 // i32 im Shader
+  F[2] = cpu.linDrag;
+  F[3] = cpu.angDrag;
+  F[4] = cpu.maxSpeed;
+  F[5] = cpu.maxAngSpeed;
+  U[6] = cpu.n;                          // u32
+  U[7] = cpu.constraints.length;         // u32
+  U[8] = cpu.collPts.length;             // u32
+  U[9] = map.rects.length;               // u32
+  F[10] = 1 / cpu.h;
+  F[11] = 1 / (cpu.h * cpu.h);
+  // SANITY-GUARD: ein falscher Wert hier kostet sonst einen GPU-Hang samt
+  // TDR-Reset und einem danach blockierten Adapter — also laut und früh werfen.
+  if (!(I[1] >= 1 && I[1] <= 64)) throw new Error(`iterations unplausibel: ${I[1]}`);
+  if (!(U[9] >= 1 && U[9] <= 100000)) throw new Error(`nRects unplausibel: ${U[9]}`);
+  if (!(U[6] >= 1 && U[6] <= 4000000)) throw new Error(`nBodies unplausibel: ${U[6]}`);
+  if (!(F[0] > 0 && F[0] < 1)) throw new Error(`h unplausibel: ${F[0]}`);
+  g.device.queue.writeBuffer(g.buffers.params, 0, F);
 
   for (let i = 0; i < map.rects.length; i++) {
     const r = map.rects[i], o = i * 4;
@@ -150,9 +166,12 @@ function writeStatic(g) {
   }
   g.device.queue.writeBuffer(g.buffers.rects, 0, g.rectData);
 
+  const collU = new Uint32Array(g.collData.buffer);
   for (let i = 0; i < cpu.collPts.length; i++) {
     const p = cpu.collPts[i], o = i * 4;
-    g.collData[o] = p.body; g.collData[o + 1] = p.lx; g.collData[o + 2] = p.ly; g.collData[o + 3] = p.r;
+    collU[o] = p.body;                              // u32 im Shader
+    g.collData[o + 1] = p.lx; g.collData[o + 2] = p.ly; g.collData[o + 3] = p.r;
+    if (p.body >= cpu.n) throw new Error(`collPt ${i} verweist auf Body ${p.body} von ${cpu.n}`);
   }
   g.device.queue.writeBuffer(g.buffers.collPts, 0, g.collData);
 }
@@ -172,18 +191,23 @@ export function upload(g) {
     g.forceData[fo] = cpu.fx[i]; g.forceData[fo + 1] = cpu.fy[i];
     g.forceData[fo + 2] = cpu.tq[i]; g.forceData[fo + 3] = 0;
   }
+  const consU = new Uint32Array(g.consData.buffer);
   for (let k = 0; k < cpu.constraints.length; k++) {
     const c = cpu.constraints[k], o = k * CONS_STRIDE;
-    g.consData[o] = c.a; g.consData[o + 1] = c.b >= 0 ? c.b : 0xffffffff;
-    g.consData[o + 2] = c.type; g.consData[o + 3] = c.owner;
+    consU[o] = c.a; consU[o + 1] = c.b >= 0 ? c.b : 0xffffffff;   // u32 im Shader
+    consU[o + 2] = c.type; consU[o + 3] = c.owner;                // u32
+    if (c.a >= cpu.n || (c.b >= 0 && c.b >= cpu.n)) {
+      throw new Error(`Constraint ${k}: Body-Index ${c.a}/${c.b} außerhalb von ${cpu.n} — das wäre ein Out-of-Bounds-Read im Shader`);
+    }
     g.consData[o + 4] = c.lax; g.consData[o + 5] = c.lay;
     g.consData[o + 6] = c.lbx; g.consData[o + 7] = c.lby;
     g.consData[o + 8] = c.compliance; g.consData[o + 9] = c.rest;
     g.consData[o + 10] = c.target; g.consData[o + 11] = c.minAngle;
     g.consData[o + 12] = c.maxAngle; g.consData[o + 13] = c.lamX || 0;
     g.consData[o + 14] = c.lamY || 0; g.consData[o + 15] = c.lambda;
-    g.consData[o + 16] = Number.isFinite(c.breakForce) ? c.breakForce : 1e30;
-    g.consData[o + 17] = c.broken ? 1 : 0;
+    g.consData[o + 16] = Number.isFinite(c.breakForce) ? Math.min(c.breakForce, 1e30) : 1e30;
+    consU[o + 17] = c.broken ? 1 : 0;                              // u32
+    consU[o + 18] = 0; consU[o + 19] = 0;                          // pads
   }
   g.device.queue.writeBuffer(g.buffers.bodies, 0, g.bodyData);
   g.device.queue.writeBuffer(g.buffers.cons, 0, g.consData);
