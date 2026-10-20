@@ -73,7 +73,7 @@ const envRow = (k, v, cls) => {
   $('env').appendChild(tr);
 };
 document.addEventListener('DOMContentLoaded', () => {});
-const BUILD_SHA = '57da2d4';
+const BUILD_SHA = '__BUILD_SHA__';
 let pass = 0, fail = 0;
 const gpuHash = (w) => { let h = 0; for (let i = 0; i < w.n; i++) { h = (h * 31 + Math.round(w.px[i] * 1e4)) | 0; h = (h * 31 + Math.round(w.py[i] * 1e4)) | 0; } return h; };
 function verdict(name, what, cpuVal, gpuVal, ok, tol) {

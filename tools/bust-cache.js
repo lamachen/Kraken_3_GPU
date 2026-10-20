@@ -33,6 +33,10 @@ function walk(d) {
     if (!/\.(html|js)$/.test(name)) continue;
     let s = readFileSync(p, 'utf8');
     const before = s;
+    // Build-Stempel in HTML-Konstanten einsetzen (sonst bleibt ein von Hand
+    // gebackener Wert stehen und der Stempel lügt — gemessen: BUILD_SHA
+    // 57da2d4 neben Modul-Stempel 7d10099).
+    if (/\.html$/.test(name)) s = s.split('__BUILD_SHA__').join(sha);
     s = s.replace(RE, (m, q, path) => {
       if (path.includes('?')) return m;          // bereits gestempelt
       hits++;
