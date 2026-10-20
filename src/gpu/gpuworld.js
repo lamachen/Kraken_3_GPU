@@ -19,6 +19,8 @@
  *   Force        4 × 4 = 16 B     fx fy torque adhesion
  */
 
+import { ensureColored } from '../physics/xpbd.js';
+
 const BODY_STRIDE = 12;
 const CONS_STRIDE = 20;
 const WORKGROUP = 64;
@@ -52,6 +54,11 @@ export async function create(cpu, map, wgslSource, device) {
     device = await adapter.requestDevice();
   }
 
+  // Defensiv: Welten, die ohne createSim() gebaut wurden (gpu.html, spätere
+  // Worker), haben möglicherweise keine Färbung. Ohne sie lägen ALLE
+  // Constraints in Farbe 0 (Schreib-Race zurück) und upload() crasht an
+  // colorOff === undefined — der von dir gemessene TypeError gpuworld.js:225.
+  ensureColored(cpu);
   const nB = cpu.n;
   const nC = cpu.constraints.length;
   const nP = cpu.collPts.length;
