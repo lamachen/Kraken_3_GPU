@@ -54,6 +54,53 @@ export const SOLVER_DEFAULTS = {
 };
 
 /** Winkel auf (-π, π] wickeln — O(1), keine while-Schleife. */
+/**
+ * Farben für race-freies paralleles Constraint-Solving.
+ *
+ * Zwei Constraints dürfen im SELBEN Dispatch laufen, solange sie keinen Körper
+ * teilen. Greedy über Inzidenz-Bitmasken: kleinste freie Farbe. Notwendig, weil
+ * paralleles Schreiben auf ppx/angP ohne Atomics ein Data-Race ist (gemessen:
+ * Determinismus-Check kippte, passives Gleichgewicht driftete 0.05 px).
+ * Maximaler Grad: Mantel mit 12 Constraints (6 Pins + 6 Motoren) → 16 Farben
+ * reichen sicher (Vizing: Δ+1).
+ *
+ * Liegt bewusst in der PHYSIK-Schicht, nicht in core.js: gpu.html baut Welten
+ * direkt aus XpbdWorld + spawnKraken (ohne createSim), und ohne Färbung wären
+ * dort alle Constraints in Farbe 0 gelandet — der Race wäre unbemerkt zurück.
+ * ensureColored() wird deshalb auch in gpuworld.create() defensiv aufgerufen.
+ */
+export const MAX_COLORS = 16;
+
+export function assignColor(colorMask, a, b) {
+  const used = colorMask[a] | (b >= 0 ? colorMask[b] : 0);
+  let c = 0;
+  while (used & (1 << c)) c++;
+  colorMask[a] |= 1 << c;
+  if (b >= 0) colorMask[b] |= 1 << c;
+  return c;
+}
+
+/** Färbt fehlende Constraints und gruppiert stabil nach Farbe. Idempotent. */
+export function ensureColored(world) {
+  if (world.colorOff) return world.colorOff;
+  const mask = new Uint32Array(Math.max(1024, world.n * 2));
+  for (const c of world.constraints) {
+    if (c.color === undefined) c.color = assignColor(mask, c.a, c.b >= 0 ? c.b : -1);
+  }
+  const buckets = Array.from({ length: MAX_COLORS }, () => []);
+  for (const c of world.constraints) buckets[c.color | 0].push(c);
+  const off = new Uint32Array(MAX_COLORS), cnt = new Uint32Array(MAX_COLORS);
+  let n = 0, maxCnt = 0;
+  for (let c = 0; c < MAX_COLORS; c++) {
+    off[c] = n; cnt[c] = buckets[c].length;
+    if (cnt[c] > maxCnt) maxCnt = cnt[c];
+    n += cnt[c];
+  }
+  world.constraints = buckets.flat();
+  world.colorOff = off; world.colorCnt = cnt; world.colorMax = maxCnt;
+  return off;
+}
+
 export function wrapAngle(a) {
   const TAU = Math.PI * 2;
   let d = a % TAU;

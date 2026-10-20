@@ -17,6 +17,7 @@
  * Spawn-Explosion (max|ω| = 3918 rad/step im ersten Frame).
  */
 import { C_ANGLE, C_GRIP, C_PIN, makeConstraint } from '../physics/xpbd.js';
+export { MAX_COLORS, assignColor, ensureColored } from '../physics/xpbd.js';
 
 export const BODY = {
   arms: 6,
@@ -49,26 +50,7 @@ export const ARM_REACH = BODY.shoulderR + BODY.segsPerArm * BODY.segLen;   // 11
 
 const rectInertia = (m, w, h) => m * (w * w + h * h) / 12;
 
-/**
- * Farben für race-freies paralleles Constraint-Solving.
- *
- * Zwei Constraints dürfen im SELBEN Dispatch laufen, solange sie keinen Körper
- * teilen. Greedy über Inzidenz-Bitmasken: kleinste freie Farbe wählen.
- * Notwendig, weil paralleles Schreiben auf ppx/angP ohne Atomics ein Data-Race
- * ist — gemessen auf RTX 3070 Ti: Determinismus-Check kippte, passives
- * Gleichgewicht driftete 0.05 px. Maximaler Grad: Mantel mit 12 Constraints
- * (6 Pins + 6 Motoren) → 16 Farben reichen sicher (Vizing: Δ+1).
- */
-export const MAX_COLORS = 16;
 
-export function assignColor(colorMask, a, b) {
-  const used = colorMask[a] | (b >= 0 ? colorMask[b] : 0);
-  let c = 0;
-  while (used & (1 << c)) c++;
-  colorMask[a] |= 1 << c;
-  if (b >= 0) colorMask[b] |= 1 << c;
-  return c;
-}
 
 /**
  * Legt einen Kraken constraint-frei in die Welt (Verletzung exakt 0.0000).
