@@ -252,7 +252,7 @@ fn solveAngle(k: u32) {
   // Abweichungs-Koordinaten — identisch zur CPU-Fassung. Absolutwinkel würden
   // gegen gewickelte Ist-Werte verglichen und Phantom-Überschreitungen erzeugen.
   let dev = angleDelta(rel, c.rest);
-  let C = angleDelta(dev, c.target);
+  let C = angleDelta(dev, c.tgt);
   if (!(C == C)) { return; }
 
   let alphaTilde = c.compliance * P.invH2;

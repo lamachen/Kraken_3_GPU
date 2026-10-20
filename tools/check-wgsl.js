@@ -109,6 +109,36 @@ console.log('\n── Workgroup-Größe ──');
   else bad(`Shader nutzt ${ws.join('/')}, JS dispatcht mit ${jsWs}`);
 }
 
+console.log('\n── Reservierte WGSL-Schlüsselwörter als Bezeichner ──');
+{
+  // Gemessen am 19.10.2026 in Chrome auf einer RTX 3070 Ti: das Feld `target`
+  // im Constraint-Struct schlug mit "'target' is a reserved keyword" fehl,
+  // Zeile 40:31 und 255:29. Solche Fehler kosten hier genau einen Browser-Start,
+  // deshalb statisch abfangen, bevor der Shader den Compiler sieht.
+  const RESERVED = new Set([
+    'asm','bf16','const_cast','dynamic_cast','enum','handle','inline','nointerpolation',
+    'namespace','precise','reinterpret_cast','row_major','sample','shared','short',
+    'sizeof','static','static_assert','static_cast','template','this','thread_local',
+    'typedef','union','using','varying','volatile','target','co_await','co_return',
+    'co_yield','goto','class','delete','new','try','catch','do','auto','type','vec',
+    'let','out','override','requires','uniform','input','output','resource','filter',
+    'active','passive','mut','nonmut','public','private','protected','friend',
+  ]);
+  const clean2 = wg.replace(/\/\/[^\n]*/g, '');
+  const offenders = [];
+  for (const m of clean2.matchAll(/struct\s+(\w+)\s*\{([^}]*)\}/g)) {
+    for (const f of m[2].split(',').map(s => s.trim()).filter(s => s.includes(':'))) {
+      const name = f.split(':')[0].trim();
+      if (RESERVED.has(name)) offenders.push(m[1] + '.' + name);
+    }
+  }
+  for (const m of clean2.matchAll(/(?:let|var<[^>]*>|var|const)\s+(\w+)\s*(?::|=)/g)) {
+    if (RESERVED.has(m[1])) offenders.push('Deklaration ' + m[1]);
+  }
+  if (offenders.length === 0) good('keine reservierten Schlüsselwörter als Feld- oder Variablennamen');
+  else bad('reservierte WGSL-Schlüsselwörter: ' + offenders.join(', '));
+}
+
 console.log('\n── Reihenfolge der Substeps (Shader-Aufrufe in gpuworld.js) ──');
 {
   const order = [...js.matchAll(/pipelines\.(\w+)/g)].map(m => m[1]);
