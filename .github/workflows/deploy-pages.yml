@@ -31,7 +31,7 @@ jobs:
       # buildless und ohne package.json, die Abhängigkeit lebt nur in der CI.
       - name: WGSL-Compiler holen (naga-wasm, optional für lokal)
         run: npm i --no-save naga-wasm@30.2.0
-      - name: Abnahme-Checks (60)
+      - name: Abnahme-Checks (61)
         run: node tools/harness.js
       - name: Shader-Compile explizit
         run: node tools/compile-wgsl.js

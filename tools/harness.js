@@ -900,6 +900,31 @@ const { createTrainer } = await import('../src/sim/train.js');
       rRace.nan === 0 && rRace.maxD > 10 * Math.max(r.maxD, 1e-9),
       `race maxΔ ${rRace.maxD.toFixed(2)} px / pathLen ${pct(rRace).toFixed(2)} %  vs  race-frei ${r.maxD.toFixed(3)} px / ${pct(r).toFixed(2)} % ` +
       `(Hardware RTX 3070 Ti pop 32: 22.02 px / -14.80 %; Emulation pop 32: 29.77 px / -14.71 %)`);
+
+    // d2) Die PHYSIK des Races, nicht nur seine Endzahlen: tools/collprobe.mjs
+    //     baut denselben Race auf der CPU nach (Punkte eines Körpers lesen
+    //     denselben Zustand, letzter Schreiber gewinnt) und misst, was das im
+    //     Untergrund anrichtet. Ohne diesen Check wüsste niemand, WARUM die
+    //     Pfade kürzer werden — und die erste Erklärung im Commit-Entwurf war
+    //     prompt falsch (mehr Slip/Brüche; gemessen: WENIGER Brüche, 9 → 3).
+    {
+      const { execFileSync } = await import('node:child_process');
+      let out = '';
+      try { out = execFileSync('node', [join(ROOT, 'tools/collprobe.mjs')], { encoding: 'utf8' }); }
+      catch (e) { out = (e.stdout || '') + (e.stderr || ''); }
+      const grab = (label, re2) => {
+        const line = out.split('\n').find(l => l.includes(label));
+        const m = line && line.match(re2);
+        return m ? Number(m[1].replace(',', '.')) : NaN;
+      };
+      const lostPct = grab('davon verworfen', /=\s*([0-9.]+)\s*%/);
+      const resRatio = grab('Rest-Pen. pro Schritt', /\(([0-9.]+)×\)/);
+      const plDev = grab('Ø pathLen', /\(([-0-9.]+) %\)/);
+      check('coll-race-physics', 'Kollisions-Race: verworfene Korrekturen + Rest-Penetration gemessen',
+        Number.isFinite(lostPct) && Number.isFinite(resRatio) && lostPct >= 20 && resRatio >= 3,
+        `${lostPct.toFixed(1)} % der Kontaktmeldungen verworfen, ${resRatio.toFixed(2)}× Rest-Penetration pro Schritt, ` +
+        `pathLen ${plDev.toFixed(2)} % (Hardware RTX 3070 Ti: -14.80 %) — der CPU-Nachbau ist ein Prädiktor für die GPU`);
+    }
   }
 
   // e) Innerhalb einer Farbklasse ist die Solve-Ordnung BELIEBIG — genau die

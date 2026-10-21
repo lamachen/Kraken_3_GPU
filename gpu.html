@@ -454,10 +454,13 @@ for (const N of [1, 64, 512]) {
 //   f32 + Jacobi (Deltas summiert)  30.54 px    99.27 %   -15.34 %    -3.69 %
 //   ECHTE RTX 3070 Ti (G7)          22.02 px    99.35 %   -14.80 %       —
 // Die Race-Zeile trifft die Hardware-Messung (pathLen -14.71 vs -14.80 %,
-// Flags 99.44 vs 99.35 %), race-frei bleibt 40× darunter, und das Vorzeichen
-// passt mechanisch: weniger Korrektur → mehr Penetration → mehr Slip/Brüche
-// → kürzerer Pfad. Also kein Chaos, sondern ein Daten-Race (WebGPU-Spec:
-// undefiniertes Verhalten bei überlappenden Writes ohne Atomics/Barrier).
+// Flags 99.44 vs 99.35 %), race-frei bleibt 40× darunter. Also kein Chaos,
+// sondern ein Daten-Race (WebGPU-Spec: undefiniertes Verhalten bei
+// überlappenden Writes ohne Atomics/Barrier). Mechanik, gemessen von
+// tools/collprobe.mjs: 45.5 % MEHR Kontaktmeldungen, 28.4 % der Korrekturen
+// verworfen, 5.80× Rest-Penetration pro Schritt — die Tiere liegen weicher im
+// Boden, der Zugweg schrumpft. (Die naheliegende Erklärung "mehr Slip, mehr
+// Grip-Brüche" ist falsch: Brüche 9 → 3, Anker-Rate 35.3 → 38.0 %.)
 // Fix: EIN Thread pro Körper, seine Punkte sequentiell in CPU-Ordnung
 // (solver.wgsl solveCollisions + collRange Binding 8). Statisch gepinnt von
 // tools/check-wgsl.js, headless reproduziert von tools/harness.js --only chaos
