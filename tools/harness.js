@@ -1182,6 +1182,60 @@ if (want('wgsl')) {
     wf.includes('gpu.html') && wf.includes('solver.wgsl') ? 'Workflow kopiert und verifiziert beide' : 'Workflow kopiert sie nicht');
 }
 
+section('CHECK V1 — VIEWER-TAKT & TRAINING-KONSOLE (Deploy + Verdrahtung)');
+if (want('viewer')) {
+  // Der Pacer ist DOM-frei (src/render/pace.js) und damit headless prüfbar.
+  // Anlass (gemessen, Build 57da2d4): index.html lief de facto immer Turbo
+  // (40 Schritte/Frame ≈ 40× Echtzeit) und meldete frames/s × Tierzahl als
+  // „Kraken-Schritte/s" — beim Benutzer kam ein 16-Hz-Armwedeln mit
+  // scheinbarem 60-Schritte-Deckel an. Tempo und Rate sind seitdem explizit.
+  const { createPacer, SIM_DT } = await import('../src/render/pace.js');
+
+  {
+    const p = createPacer({ speed: 1, maxPerFrame: 60 });
+    let n = 0;
+    for (let i = 0; i < 60; i++) n += p.update(1000 / 60);
+    check('pace-realtime', 'Pacer 1×: 1 Echtsekunde (60 Frames) = 60 Sim-Schritte',
+      Math.abs(n - 60) <= 1 && Math.abs(SIM_DT - 1 / 60) < 1e-12,
+      `${n} Schritte, SIM_DT = ${SIM_DT.toFixed(6)} s`);
+  }
+  {
+    const p = createPacer({ speed: 16, maxPerFrame: 60 });
+    let n = 0, cap = 0;
+    for (let i = 0; i < 60; i++) { const k = p.update(1000 / 60); n += k; if (k > cap) cap = k; }
+    check('pace-multiplier', 'Pacer 16×: 960 Schritte/s, Frame-Deckel (maxPerFrame) greift',
+      Math.abs(n - 960) <= 16 && cap <= 60, `${n} Schritte in 1 s, max ${cap}/Frame`);
+  }
+  {
+    const p = createPacer({ speed: Infinity, maxPerFrame: 60 });
+    const turbo = p.update(16);
+    p.setPaused(true);
+    const paused = p.update(16);
+    p.setSpeed(1); p.setPaused(false);
+    const burst = p.update(5000);   // Tab-Wechsel: 5 s Standbild am Stück
+    check('pace-turbo-pause', 'Turbo → Budget-Modus (-1), Pause → 0, Standbild → kein Aufhol-Burst',
+      turbo === -1 && paused === 0 && burst <= 60,
+      `turbo=${turbo}, pause=${paused}, 5-s-Standbild → ${burst} (Deckel 60)`);
+  }
+
+  // Deploy + Verdrahtung der Training-Konsole (statisch, wie wgsl-deployed)
+  const wf2 = readFileSync(join(ROOT, '.github/workflows/deploy-pages.yml'), 'utf8');
+  const th = readFileSync(join(ROOT, 'train.html'), 'utf8');
+  const ih = readFileSync(join(ROOT, 'index.html'), 'utf8');
+  const depOk = /cp -r [^\n]*train\.html/.test(wf2) && wf2.includes('test -f site/train.html');
+  const wireOk = th.includes('./src/sim/gputrain.js') && th.includes('gpuTrainStep')
+    && th.includes('createTrainer') && th.includes('gpuBackend') && ih.includes('./train.html');
+  check('console-deployed', 'train.html wird deployed und verdrahtet den Hybrid-Trainer',
+    depOk && wireOk,
+    depOk ? (wireOk ? 'Workflow kopiert + test -f; Konsole fährt gpuTrainStep/createTrainer/gpuBackend; Viewer verlinkt sie'
+                    : 'Workflow ok, aber train.html verdrahtet den Trainer nicht wie erwartet')
+          : 'Workflow kopiert/verifiziert train.html nicht');
+  const stampOk = ih.includes('__BUILD_SHA__') && th.includes('__BUILD_SHA__')
+    && !ih.includes('57da2d4') && !th.includes('57da2d4');
+  check('build-stamps', 'index.html/train.html tragen __BUILD_SHA__ (bust-cache füllt ihn, kein Handstempel)',
+    stampOk, stampOk ? 'beide Seiten nutzen den Platzhalter' : 'Seite nutzt einen von Hand gebackenen Stempel');
+}
+
 section('ZUSAMMENFASSUNG');
 const pass = results.filter(r => r.pass).length;
 for (const r of results) if (!r.pass) console.log(`  ❌ ${r.id}: ${r.name} — ${r.detail}`);

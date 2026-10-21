@@ -61,8 +61,9 @@ src/sim/core.js        DOM-freier Simulationskern: Zustand, Propriozeption, Steu
 src/gpu/solver.wgsl    WGSL-Port des Solvers (Jacobi, f32, sequentielle Farb-Dispatches).
 src/gpu/gpuworld.js    Buffer/Bind-Groups, upload/packControls, step, download/mirrorInto.
 src/sim/gputrain.js    Hybrid-Trainer: Physik GPU, Sinne/Netz/ES CPU, Zustandsspiegel.
-src/render/            EINZIGE DOM-abhängige Schicht (view.js) + Platzhalter-Gang (demo.js).
-tools/harness.js       66 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
+src/render/            EINZIGE DOM-abhängige Schicht (view.js), Platzhalter-Gang (demo.js),
+                       Viewer-Takt (pace.js — DOM-frei, Checks pace-*).
+tools/harness.js       71 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
 tools/profile-step.js  Zerlegt den Tier-Schritt in Phasen (µs) — Architektur-Entscheide.
 tools/mocktrain.js     Hybrid-Trainer headless ohne Device (Passthrough/f32-Mock).
 tools/f32solver.mjs    f32-Solver-Emulation (WGSL-Semantik per-op, 4 Kollisions-Modi).
@@ -71,6 +72,7 @@ tools/collprobe.mjs    Misst, was der Race physikalisch anrichtet (verworfene Ko
 tools/compile-wgsl.js  Echter WGSL-Compile (naga als WASM) — optional, in der CI Pflicht.
 tools/gaitprobe.mjs    Misst den Gang: Greif-Ereignisse pro Arm gegen das, was score() sieht.
 tools/strideprobe.mjs  Skript-Gänge gegen das trainierte Netz — physikalischer Kopfraum.
+tools/demogait-probe.mjs Platzhalter gegen Skript-Demo-Gänge — warum legacy weiterläuft.
 tools/*-probe.mjs      Messproben: Lyapunov, Injektion, Bruch-Timing, Ordnung, f32-Parität.
 ```
 
@@ -132,7 +134,7 @@ voll gestellt   (900 N Grenze)  → hält unter demselben Zug
 ## Abnahme: `node tools/harness.js`
 
 ```
-66/66 Checks bestanden
+71/71 Checks bestanden
   passiv        exakt in Ruhe            Pfad 0.00e+0 px        (v2: 964 px)
   slack-fixpoint Störung < slack         Δ = 0.00e+0 px, v = 0  (f32-Boden: GPU driftete 1.28 px)
   slack-corrects 25× slack korrigiert    0.050 px → 1.95e-3 px
@@ -185,6 +187,12 @@ voll gestellt   (900 N Grenze)  → hält unter demselben Zug
   input-finite  0 NaN/Inf über 400 Schritte
   input-range   hart auf ±1.2 geklemmt (Hard-Stop erlaubt Überschwingen bis 1.61)
   input-senses  25/43 Sinneswerte aktiv
+
+  pace-realtime  1× = 60 Sim-Schritte/Echtsekunde (vorher: versteckter 40×-Turbo)
+  pace-multiplier 16× = 960/s, Frame-Deckel greift
+  pace-turbo-pause Turbo-Budgetmodus, Pause, kein Aufhol-Burst nach Standbild
+  console-deployed train.html wird deployed und verdrahtet den Hybrid-Trainer
+  build-stamps   keine handgebackenen Stempel — __BUILD_SHA__ in allen Seiten
 ```
 
 ### Eingangs-Layout (Teil der Schnittstelle — nicht mehr umstellen, ohne Genome zu verwerfen)
@@ -403,16 +411,24 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
    G6 Durchsatz 0.3× (N=1) / 18.6× (N=64) / **90.8× (N=512) = 455 111
    Kraken-Schritte/s**.
 
-   **Offener Hardware-Messstand: G7 nach dem Kollisions-Race-Fix.** G1–G6 und
-   G8 sind auf der RTX 3070 Ti grün (letzte Messung Build `529fdc7`: G8 6.8×,
-   512 Episoden in 12.4 s). G7 lieferte dort maxΔ 22.02 px / Flags 99.35 % /
-   pathLen -14.80 % — mit dem Race im Shader. Erwartet werden nach dem Fix die
-   Zahlen der race-freien Emulation: maxΔ ≈ 0.4 px, Flags ≈ 100 %, pathLen
-   ≈ 0 %, Fitness ≈ 0 %. Solange diese Messung aussteht, ist der Fix headlos
-   bewiesen (Äquivalenz-Check `coll-grouping`: 128 Posen, 26 356 Kontakte,
-   max|Δ| = 0.00e+0 px gegen `_solveCollisions`) und statisch abgesichert
-   (`check-wgsl.js` Kollisions-Race-Abschnitt, `compile-wgsl.js` naga-Compile),
-   aber nicht auf echtem Silizium.
+   **Hardware-Messstand nach dem Kollisions-Race-Fix: 19/19 grün (RTX 3070 Ti,
+   Build `4b32a00`, Benutzer-Protokoll).** G7 — das zuvor offene Tor — liefert
+   auf echtem Silizium die Zahlen der race-freien Emulation: maxΔ **0.3530 px**
+   (Ø 0.0085 px, Tor < 5 px), Grip-Flags **100.000 %**, Brüche 26 823 →
+   26 823 (±10 %), pathLen 16.89 → 16.89 (**+0.02 %**), Fitness 47.12 → 47.13
+   (**0.00 %**), Beute-Δ 0.03 px. Die In-situ-Kontrolle im selben Lauf
+   (CPU-Listenordnung gedreht, reines f64) zeigt maxΔ 27.77 px / pathLen
+   −7.91 % / Fitness −13.22 % — die Tore diskriminieren, sie sind nicht blind.
+   G6: 0.3× (N=1) / 16.9× (N=64) / **72.1× (N=512) = 365 062 Kraken-
+   Schritte/s**. G8: GPU-Trainer **23 648.7 Tier-Schritte/s = 4.5×** der
+   CPU-Kalibrierung (5270), 512 Episoden in 10.8 s (21.1 ms/Episode), und es
+   wird durch die Mirror-Pipeline gelernt: Gen 0 → 1 best 193.7 → 259.7,
+   Anker 52 → 78 %, Wechselgriffe 0.1 → 0.6 (revidierte Fitness — Scores sind
+   mit den Vor-Revision-Zahlen nicht vergleichbar, Durchsatz und px schon).
+   Damit ist der Race-Fix nicht mehr nur headlos bewiesen (`coll-grouping`:
+   128 Posen, 26 356 Kontakte, max|Δ| = 0.00e+0) und statisch abgesichert
+   (`check-wgsl.js`, `compile-wgsl.js`), sondern auf der Ziel-Hardware
+   bestätigt: **der GPU-Solver ist das CPU-Oracle bis 0.35 px.**
 
    Zwei Befunde aus der 10/11-Runde (`d487532`), beide
    behoben und als Regression gepinnt:
@@ -522,7 +538,8 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
    | f32 + Race, letzter Punkt gewinnt | 29.77 px | 99.44 % | -14.71 % | -14.77 % |
    | f32 + Race, erster Punkt gewinnt | 51.10 px | 99.35 % | -21.83 % | -20.39 % |
    | f32 + Jacobi (alle Deltas summiert) | 30.54 px | 99.27 % | -15.34 % | -11.13 % |
-   | **echte RTX 3070 Ti (G7, Build 529fdc7)** | **22.02 px** | **99.35 %** | **-14.80 %** | — |
+   | echte RTX 3070 Ti (G7, Build 529fdc7, MIT Race) | 22.02 px | 99.35 % | -14.80 % | — |
+   | **echte RTX 3070 Ti (G7, Build 4b32a00, NACH Fix)** | **0.35 px** | **100.00 %** | **+0.02 %** | **0.00 %** |
 
    maxΔ, Grip-Flags und pathLen sind Physik und blieben über die Fitness-
    Revision exakt gleich; die Fitness-Spalte ist mit der revidierten Fitness
@@ -537,6 +554,9 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
    Flags 99.44 vs 99.35 %), race-frei bleibt **40× darunter**. Es war also
    kein Chaos, sondern ein Daten-Race — laut WebGPU-Spezifikation
    undefiniertes Verhalten bei überlappenden Writes ohne Atomics oder Barriere.
+   Die Nachmessung desselben Tors auf Build `4b32a00` bestätigt den Fix auf
+   derselben Hardware: **0.35 px / +0.02 %** statt 22.02 px / −14.80 %
+   (19/19-Protokoll, Abschnitt oben).
 
    **Was der Race physikalisch anrichtet** (`tools/collprobe.mjs`, derselbe
    Lauf, Race auf der CPU nachgebaut; Harness-Check `coll-race-physics`):
@@ -610,10 +630,72 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
    In v2 war die komplette gegenseitige Wahrnehmung gebaut, stand aber unter
    keinem Selektionsdruck: `stepPhysics` hatte null Referenzen auf den Spieler.
 
+## Viewer & Training-Konsole
+
+**`index.html` — Viewer.** Der Platzhalter-Gang (`src/render/demo.js`) driftet
+netto nur ~4–6 px/s, während die Arme mit einer Periode von 150 Schritten
+(2.5 s Sim-Zeit) wedeln. Daraus folgen zwei Präsentations-Entscheidungen,
+beide gemessen statt geraten:
+
+- **Tempo ist explizit.** Bis Build `4b32a00` lief der Viewer de facto immer
+  im Turbo (bis zu 40 Schritte/Frame ≈ 40× Echtzeit): die Arme wedelten mit
+  ~16 Hz, die Drift verschwand — das Tier wirkte wie ein Kreisel, und die
+  HUD-Rate zeigte frames/s × Tierzahl unter dem Label „Kraken-Schritte/s"
+  (60 = Deckel? nein: Anzeige-Fehler). Jetzt: `src/render/pace.js`
+  (DOM-frei, Checks `pace-*`), Standard **1× Echtzeit**, `S` schaltet
+  1×/4×/16×/Turbo, und die HUD-Rate zählt echte Sim-Schritte pro
+  Echtsekunde.
+- **Netto-Bewegung wird sichtbar.** Taste `T`: Mantel-Spur + Spawn-Kreuz;
+  HUD: **Netto** (Luftlinie vom Spawn) neben **Weg** (Pfadlänge); Taste `F`:
+  Kamera folgt Tier 0 (2× Zoom).
+
+Soll der Platzhalter durch einen „richtigen" Skript-Gang ersetzt werden?
+Gemessen (`tools/demogait-probe.mjs`, identische Spawns, seed 7): **nein** —
+keiner der Kandidaten läuft langfristig besser.
+
+| Konfiguration | netto px (500 Schr.) | Umdreh. | netto px (1500 Schr.) | Umdreh. | px/Umdreh. (lang) |
+|---|---|---|---|---|---|
+| **legacy (Platzhalter)** | 32.8 | 0.55 | **96.1** | 1.77 | **54.3** |
+| wave T=32 | 47.6 | 1.05 | 58.6 | 3.13 | 18.7 |
+| wave T=64 | 33.0 | 0.85 | 64.3 | 2.48 | 25.9 |
+| sync T=32 | 52.5 | 3.84 | 36.5 | 12.16 | 3.0 (Kreisel) |
+| tripod T=16/32/64 | 22.4–28.4 | 1.18–1.74 | — | — | — |
+
+Kurzfristig führt `sync T=32` (52.5 px), langfristig ist es ein Kreisel
+(12.2 Umdrehungen für 36.5 px netto). Der Platzhalter hat mit Abstand den
+besten Netto-Weg pro Umdrehung und 100 % Anker-Zeit — er bleibt; die
+Präsentation macht seine Drift sichtbar. Echtes Laufen ist Aufgabe der
+Evolution (Stand dazu: Punkt 3, `strideprobe`: 64.4 px Skript-Kopfraum
+gegenüber 24–30 px evolviert = Suchproblem, kein Physikproblem).
+
+**`train.html` — Training-Konsole.** Interaktiver Trainer auf denselben
+Modulen wie gpu.html G8 (`src/sim/train.js`, `src/sim/gputrain.js`): Physik
+auf der GPU (ein geteiltes WebGPU-Device, automatischer CPU-Fallback mit
+Log-Meldung), Sinne/Netz/ES auf der CPU über den Zustandsspiegel.
+
+- **Regler:** Population 16–256, Schritte/Generation 450/900/1800, Seed,
+  Beute aus/4. Parameter-Änderung baut den Trainer neu (GPU-World wird
+  zerstört und neu angelegt — die Device-Leak-Lehre aus gpu.html).
+- **Lauf:** Start/Pause (Leertaste), „1 Generation" (G) läuft bis zum
+  Generationsende und pausiert, Reset. Fortschrittsbalken = Schritte der
+  laufenden Generation.
+- **Telemetrie pro Generation:** Fitness best/Ø (Sparkline), σ, Netto-px
+  Ø/Episode, Wechselgriffe Ø, Anker-Zeit Ø, Spin Ø, Geradheit, Tier-
+  Schritte/s, Episoden-Zähler. „📋 kopieren" liefert Parameter + Verlauf
+  (TSV) + Log — dasselbe Format wie der gpu.html-Log-Knopf.
+- **🏆 Champion (C):** Zeitlupen-Replay des besten je gefundenen Genoms —
+  eigener CPU-Trainer (popSize 2, beide Genome = Champion), 30 Schritte/s
+  = 0.5× Echtzeit, Kamera folgt, Spur an. Bewusst derselbe Code-Pfad wie
+  das Training (`trainStep`), kein separater Replay-Zweig, der abweichen
+  könnte.
+- **Kamera:** Überblick (ganze Population) oder folgt dem besten Tier der
+  letzten Generation (Index bleibt über den Respawn stabil, weil
+  `spawnCache` dieselben Startplätze wiederverwendet).
+
 ## Lokal
 
 ```bash
-node tools/harness.js          # 66 Abnahme-Checks
+node tools/harness.js          # 71 Abnahme-Checks
 node tools/harness.js --only chaos          # G7-Fehlerklassen (absorbiert vs chaotisch)
 node tools/check-wgsl.js       # Shader/Binding-Konsistenz (Textvergleich, ohne GPU)
 npm i --no-save naga-wasm@30.2.0 && node tools/compile-wgsl.js   # echter WGSL-Compile
@@ -625,6 +707,7 @@ node tools/class-spread.mjs --pop 32 --seeds 7,13 --variants ctrl,f32,f32race
 node tools/collprobe.mjs                    # Physik des Kollisions-Race (4 s)
 node tools/gaitprobe.mjs --gens 6           # Gang: Ereignisse pro Arm vs. Fitness-Sicht (30 s)
 node tools/strideprobe.mjs                  # Skript-Gänge vs. trainiertes Netz (110 s)
+node tools/demogait-probe.mjs               # Demo-Gang-Kandidaten (27 s; --longonly: 14 s)
 node tools/harness.js --only fitness        # die 5 Fehlanreiz-Regressionen der Fitness
 python3 -m http.server 8080    # oder: npx serve .   → http://localhost:8080
 ```
@@ -632,4 +715,7 @@ python3 -m http.server 8080    # oder: npx serve .   → http://localhost:8080
 ES-Module brauchen einen Server (CORS bei `file://`). Kein Build, keine
 Abhängigkeiten.
 
-Tasten: `1…4` = 1/4/16/64 Tiere · `Leertaste` = Pause · `R` = Karte neu würfeln.
+Viewer (`index.html`): `S` = Tempo (1×/4×/16×/Turbo) · `T` = Spur · `F` = Kamera
+folgt · `1…4` = 1/4/16/64 Tiere · `Leertaste` = Pause · `R` = Karte neu würfeln.
+Training-Konsole (`train.html`): `Leertaste` = Start/Pause · `G` = eine
+Generation · `C` = Champion-Zeitlupe · `R` = Reset.

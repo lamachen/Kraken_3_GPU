@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kraken 3 — Training-Konsole</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:#000409;overflow:hidden;color:#3affa8;
+  font-family:'Share Tech Mono',ui-monospace,Menlo,Consolas,monospace}
+canvas#c{position:fixed;inset:0;display:block}
+#ui{position:fixed;top:0;right:0;bottom:0;width:400px;z-index:10;overflow-y:auto;
+  background:rgba(0,6,4,.92);border-left:1px solid #0f32;padding:14px 16px;font-size:12px;line-height:1.55}
+h1{font-size:15px;letter-spacing:2px;color:#00ffb3;margin-bottom:2px}
+.sub{color:#0f68;font-size:11px;margin-bottom:12px}
+h2{font-size:11px;letter-spacing:1.5px;color:#0f8;margin:14px 0 6px;border-bottom:1px solid #0f32;padding-bottom:3px}
+table{width:100%;border-collapse:collapse}
+td{padding:2px 6px;border-bottom:1px solid #0a2a1c;font-size:12px}
+td.num{text-align:right;font-variant-numeric:tabular-nums;color:#00ffb3}
+td.lbl{color:#0f68}
+.dim{color:#0f68}.ok{color:#00ffb3}.bad{color:#ff3a6e}.warn{color:#ffdd00}
+button{background:rgba(0,12,8,.85);border:1.5px solid #0f35;color:#0f8;padding:6px 10px;cursor:pointer;
+  border-radius:4px;font-family:inherit;font-size:11px;letter-spacing:1px}
+button:hover{border-color:#0f8;background:rgba(0,255,128,.1)}
+button.on{border-color:#0f8;color:#000;background:#0f8}
+button:disabled{opacity:.35;cursor:default}
+select,input[type=number]{background:#00120c;border:1px solid #0f35;color:#3affa8;font-family:inherit;
+  font-size:12px;padding:4px 6px;border-radius:4px;width:100%}
+.ctl{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px}
+.ctl label{color:#0f68;font-size:10px;letter-spacing:1px;display:block;margin-bottom:2px}
+.row{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+#prog{height:6px;background:#021;border:1px solid #0f32;border-radius:3px;margin:6px 0;overflow:hidden}
+#progFill{height:100%;width:0%;background:#0f8;transition:width .1s linear}
+#spark{width:100%;height:96px;background:rgba(0,12,8,.6);border:1px solid #0f32;border-radius:4px}
+pre#log{background:rgba(0,12,8,.6);border:1px solid #0f32;border-radius:4px;padding:8px;
+  overflow-x:auto;font-size:10.5px;color:#88ffcc;white-space:pre-wrap;max-height:220px;overflow-y:auto}
+a{color:#0f8}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <h1>TRAINING-KONSOLE</h1>
+  <div class="sub">
+    Build <b id="build" class="warn">__BUILD_SHA__</b> · Evolutionäre Suche (Natural ES, gespiegelt) ·
+    MLP 105→24→24→20 · Physik: <b id="backend">wird geprüft…</b>
+    · <a href="./">← Viewer</a> · <a href="./gpu.html">Validierung</a>
+  </div>
+
+  <h2>Parameter</h2>
+  <div class="ctl">
+    <div><label>POPULATION</label><select id="selPop">
+      <option>16</option><option>32</option><option selected>64</option><option>128</option><option>256</option>
+    </select></div>
+    <div><label>SCHRITTE / GENERATION</label><select id="selSteps">
+      <option>450</option><option selected>900</option><option>1800</option>
+    </select></div>
+    <div><label>SEED</label><input type="number" id="inSeed" value="7" min="0" max="999999"></div>
+    <div><label>BEUTE (Duft/Lärm)</label><select id="selPrey">
+      <option value="0" selected>aus</option><option value="4">4 Tiere</option>
+    </select></div>
+  </div>
+  <div class="row">
+    <button id="bStart">▶ Start</button>
+    <button id="bGen">1 Generation</button>
+    <button id="bReset">Reset</button>
+    <button id="bChamp" disabled>🏆 Champion</button>
+    <button id="bFollow">Kamera: Überblick</button>
+  </div>
+  <div class="dim" style="font-size:10.5px">Leertaste = Start/Pause · G = 1 Generation · C = Champion · R = Reset.
+    Parameter-Änderung → Reset wird automatisch ausgeführt.</div>
+
+  <h2>Lauf</h2>
+  <div id="prog"><div id="progFill"></div></div>
+  <table>
+    <tr><td class="lbl">Generation</td><td class="num" id="tGen">0</td>
+        <td class="lbl">Episoden</td><td class="num" id="tEpi">0</td></tr>
+    <tr><td class="lbl">Fitness best</td><td class="num" id="tBest">–</td>
+        <td class="lbl">Ø</td><td class="num" id="tMean">–</td></tr>
+    <tr><td class="lbl">Rekord (bestEver)</td><td class="num" id="tEver">–</td>
+        <td class="lbl">σ</td><td class="num" id="tSigma">–</td></tr>
+    <tr><td class="lbl">Netto Ø px/Episode</td><td class="num" id="tDisp">–</td>
+        <td class="lbl">Wechselgriffe Ø</td><td class="num" id="tStrides">–</td></tr>
+    <tr><td class="lbl">Anker-Zeit Ø</td><td class="num" id="tAnchor">–</td>
+        <td class="lbl">Spin Ø Umdr.</td><td class="num" id="tSpin">–</td></tr>
+    <tr><td class="lbl">Geradheit Ø</td><td class="num" id="tStraight">–</td>
+        <td class="lbl">Tier-Schritte/s</td><td class="num" id="tRate">–</td></tr>
+  </table>
+
+  <h2>Fitness-Verlauf <span class="dim">(hell: best · dunkel: Ø)</span></h2>
+  <canvas id="spark"></canvas>
+
+  <h2 style="display:flex;align-items:center;gap:10px">Log
+    <button id="bCopy" style="padding:2px 10px;font-size:10px">📋 kopieren</button></h2>
+  <pre id="log"></pre>
+</div>
+
+<script type="module">
+import { createTrainer, endGeneration, trainStep, N_W,
+         gpuTrainStep, beginGenerationGpu, gpuBackend } from './src/sim/gputrain.js';
+import { isAvailable, create as createGpu, destroy as destroyGpu, loadWgsl } from './src/gpu/gpuworld.js';
+import { createView } from './src/render/view.js';
+
+{ const b = document.getElementById('build'); if (b.textContent.includes('__')) b.textContent = 'dev'; }
+
+const el = (id) => document.getElementById(id);
+const canvas = el('c');
+let logText = '';
+function say(s) {
+  logText += s + '\n';
+  const p = el('log'); p.textContent = logText; p.scrollTop = p.scrollHeight;
+}
+
+// ── Zustand ──────────────────────────────────────────────────────────
+let device = null, wgsl = null;          // WebGPU (ein Device für die Seite)
+let gpu = null, backend = null;          // Physik-Backend des Trainers
+let tr = null, view = null;              // Training
+let mode = 'idle';                       // 'idle' | 'train' | 'champ'
+let running = false, genTarget = false, busy = false;
+let champTr = null, champView = null, champGenome = null, champSteps = 0, champTick = 0;
+let bestEver = -Infinity;
+let followOn = false, lastBestIdx = 0;
+let winT = performance.now(), winSteps = 0;
+
+// ── WebGPU-Init (ein geteiltes Device — gpu.html-Lehre aus dem Leak) ──
+(async function initBackend() {
+  if (isAvailable()) {
+    try {
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) throw new Error('requestAdapter() lieferte null');
+      device = await adapter.requestDevice();
+      device.lost.then((i) => say('⚠ Device verloren: ' + (i.message || i.reason)));
+      wgsl = await loadWgsl();
+      const info = adapter.info || {};
+      el('backend').textContent = 'GPU (' + (adapter.isFallbackAdapter ? 'Fallback' : 'Hardware')
+        + (info.vendor ? ' · ' + info.vendor : '') + ')';
+      say(`Backend: WebGPU-${adapter.isFallbackAdapter ? 'Fallback' : 'Hardware'}-Adapter, Shader ${wgsl.length} Zeichen.`);
+      say('Physik auf der GPU, Sinne/Netz/ES auf der CPU (Zustandsspiegel, G7-geprüft: maxΔ < 5 px).');
+    } catch (e) {
+      device = null;
+      el('backend').textContent = 'CPU (GPU-Init fehlgeschlagen)';
+      el('backend').className = 'warn';
+      say('GPU-Init fehlgeschlagen → CPU-Backend: ' + e.message);
+    }
+  } else {
+    // Kein frühes return hier — buildTrainer() darunter ist der einzige Weg
+    // in den lauffähigen Zustand; mit return bliebe die Konsole ohne WebGPU tot.
+    el('backend').textContent = 'CPU (kein WebGPU)';
+    el('backend').className = 'warn';
+    say('WebGPU nicht verfügbar → CPU-Backend. Training läuft, aber deutlich langsamer (G8 maß die GPU mit 4.5×).');
+  }
+  await buildTrainer();
+  say('Bereit — ▶ Start (oder Leertaste).');
+})();
+
+function uiOpts() {
+  return {
+    popSize: parseInt(el('selPop').value, 10),
+    stepsPerGen: parseInt(el('selSteps').value, 10),
+    seed: parseInt(el('inSeed').value || '7', 10),
+    prey: parseInt(el('selPrey').value, 10),
+  };
+}
+
+async function buildTrainer() {
+  const o = uiOpts();
+  if (gpu) { destroyGpu(gpu); gpu = null; backend = null; }
+  tr = createTrainer(o);
+  if (device && wgsl) {
+    try {
+      gpu = await createGpu(tr.sim.world, tr.sim.map, wgsl, device);
+      backend = gpuBackend(gpu);
+    } catch (e) {
+      gpu = null; backend = null;
+      say('⚠ GPU-World fehlgeschlagen → CPU: ' + e.message);
+    }
+  }
+  beginGenerationGpu(tr, backend);
+  view = createView(canvas, tr.sim);
+  view.setTrail(true);
+  applyFollow();
+  bestEver = -Infinity; lastBestIdx = 0;
+  champGenome = null; el('bChamp').disabled = true;
+  drawSpark();
+  say(`Trainer bereit: pop ${o.popSize}, ${o.stepsPerGen} Schritte/Gen, Seed ${o.seed}, ` +
+      `Beute ${o.prey}, Backend ${backend ? 'GPU' : 'CPU'}.`);
+}
+
+function applyFollow() {
+  if (!view) return;
+  view.setFollow(followOn ? lastBestIdx : null, 2.1);
+  el('bFollow').textContent = followOn ? `Kamera: Tier #${lastBestIdx}` : 'Kamera: Überblick';
+  el('bFollow').classList.toggle('on', followOn);
+}
+
+// ── Trainings-Schleife ───────────────────────────────────────────────
+async function trainSlice(budgetMs) {
+  const t0 = performance.now();
+  while (running && performance.now() - t0 < budgetMs) {
+    if (tr.stepInGen >= tr.opts.stepsPerGen) {
+      finishGen();
+      if (genTarget) { genTarget = false; setRunning(false); break; }
+      if (!running) break;
+    }
+    if (backend) await gpuTrainStep(tr, backend); else trainStep(tr);
+    winSteps++;
+  }
+}
+
+function finishGen() {
+  if (tr.sim.world.stats.nan > 0) {
+    say('✖ NaN in der Welt — Lauf gestoppt.');
+    setRunning(false);
+    return;
+  }
+  const rec = endGeneration(tr);
+  // Champion-Genom sichern: das beste Tier DIESER Generation (Fitness steht
+  // in tr.fitness, bis endGeneration() nächstes Mal überschreibt).
+  let bi = 0;
+  for (let i = 1; i < tr.fitness.length; i++) if (tr.fitness[i] > tr.fitness[bi]) bi = i;
+  lastBestIdx = bi;
+  if (rec.best > bestEver) {
+    bestEver = rec.best;
+    champGenome = Float32Array.from(tr.genomes.subarray(bi * N_W, (bi + 1) * N_W));
+    el('bChamp').disabled = false;
+  }
+  if (!isFinite(rec.best)) { say('✖ Fitness nicht endlich — Lauf gestoppt.'); setRunning(false); return; }
+  say(`Gen ${rec.gen}: best ${rec.best.toFixed(1)} · Ø ${rec.mean.toFixed(1)} · σ ${rec.sigma.toFixed(4)} · ` +
+      `netto Ø ${rec.disp.toFixed(1)} px · Wechselgriffe Ø ${rec.strides.toFixed(1)} · Anker ${(rec.anchor * 100).toFixed(0)} %`);
+  updateRecTelemetry(rec);
+  drawSpark();
+  beginGenerationGpu(tr, backend);
+  if (followOn) applyFollow();
+}
+
+function setRunning(r) {
+  running = r;
+  el('bStart').textContent = r ? '⏸ Pause' : '▶ Start';
+  el('bStart').classList.toggle('on', r);
+}
+
+// ── Champion-Zeitlupe (CPU, 30 Schritte/s, Kamera folgt) ────────────
+function enterChamp() {
+  if (!champGenome) return;
+  setRunning(false);
+  mode = 'champ'; champSteps = 0; champTick = 0;
+  const o = uiOpts();
+  champTr = createTrainer({ popSize: 2, stepsPerGen: 1e9, seed: o.seed, prey: 0 });
+  beginGenerationGpu(champTr, null);
+  champTr.genomes.set(champGenome, 0);
+  champTr.genomes.set(champGenome, N_W);
+  champView = createView(canvas, champTr.sim);
+  champView.setTrail(true);
+  champView.setFollow(0, 2.1);
+  el('bChamp').textContent = '← zurück zum Training';
+  el('bChamp').classList.add('on');
+  say(`Champion (Fitness ${bestEver.toFixed(1)}) in Zeitlupe: 30 Schritte/s = 0.5× Echtzeit.`);
+}
+function exitChamp() {
+  mode = tr ? 'train' : 'idle';
+  champTr = null; champView = null;
+  el('bChamp').textContent = '🏆 Champion';
+  el('bChamp').classList.remove('on');
+  const h = tr ? tr.history : [];
+  if (h.length) updateRecTelemetry(h[h.length - 1]);   // Champion-HUD zurückbauen
+}
+
+// ── Haupt-Loop ───────────────────────────────────────────────────────
+let frameN = 0;
+function frame() {
+  requestAnimationFrame(frame);
+  frameN++;
+  const now = performance.now();
+
+  if (mode === 'champ') {
+    if (champTr && (champTick++ % 2 === 0)) { trainStep(champTr); champSteps++; }
+    if (champView) champView.draw();
+    const c = champTr.sim.creatures[0];
+    el('tDisp').textContent = Math.hypot(c.x - c.spawn.x, c.y - c.spawn.y).toFixed(1);
+    el('tStrides').textContent = c.strides.toFixed(0);
+    el('tGen').textContent = '🏆';
+    el('tEpi').textContent = (champSteps / 60).toFixed(1) + ' s';
+  } else if (tr) {
+    if (running && !busy) { busy = true; trainSlice(10).finally(() => { busy = false; }); }
+    const light = tr.opts.popSize > 128 ? (frameN % 2 === 0) : true;
+    if (light && view) view.draw();
+    el('progFill').style.width = (100 * tr.stepInGen / tr.opts.stepsPerGen).toFixed(1) + '%';
+    el('tGen').textContent = tr.gen;
+    el('tEpi').textContent = tr.gen * tr.opts.popSize;
+  }
+
+  if (now - winT > 500) {
+    const pop = mode === 'champ' ? 2 : (tr ? tr.opts.popSize : 1);
+    const r = winSteps * pop / ((now - winT) / 1000);
+    el('tRate').textContent = r > 0 ? Math.round(r).toLocaleString('de-DE') : '–';
+    winSteps = 0; winT = now;
+  }
+}
+frame();
+
+// ── Telemetrie + Sparkline ───────────────────────────────────────────
+function updateRecTelemetry(rec) {
+  el('tBest').textContent = rec.best.toFixed(1);
+  el('tMean').textContent = rec.mean.toFixed(1);
+  el('tEver').textContent = bestEver.toFixed(1);
+  el('tSigma').textContent = rec.sigma.toFixed(4);
+  el('tDisp').textContent = rec.disp.toFixed(1);
+  el('tStrides').textContent = rec.strides.toFixed(1);
+  el('tAnchor').textContent = (rec.anchor * 100).toFixed(0) + ' %';
+  el('tSpin').textContent = rec.spin.toFixed(2);
+  el('tStraight').textContent = (rec.straight * 100).toFixed(0) + ' %';
+}
+function drawSpark() {
+  const cv = el('spark');
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const W = cv.clientWidth || 368, H = 96;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const g = cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  const h = tr ? tr.history : [];
+  if (h.length < 2) {
+    g.fillStyle = '#0f68'; g.font = '10px monospace';
+    g.fillText('noch keine Generationen', 8, H / 2);
+    return;
+  }
+  let max = 1;
+  for (const r of h) max = Math.max(max, r.best, r.mean);
+  const x = (i) => 4 + (W - 8) * i / (h.length - 1);
+  const y = (v) => H - 6 - (H - 12) * (v / max);
+  for (const [key, col] of [['mean', 'rgba(0,255,179,0.30)'], ['best', '#00ffb3']]) {
+    g.strokeStyle = col; g.lineWidth = 1.4;
+    g.beginPath();
+    h.forEach((r, i) => i ? g.lineTo(x(i), y(Math.max(0, r[key]))) : g.moveTo(x(0), y(Math.max(0, r[key]))));
+    g.stroke();
+  }
+  g.fillStyle = '#0f68'; g.font = '9px monospace';
+  g.fillText(`Gen ${h[0].gen}…${h[h.length - 1].gen}`, 6, 10);
+  g.fillText(max.toFixed(0), W - 34, 10);
+}
+
+// ── Buttons & Tasten ─────────────────────────────────────────────────
+el('bStart').onclick = () => {
+  if (mode === 'champ') exitChamp();
+  if (!tr) return;
+  mode = 'train';
+  setRunning(!running);
+};
+el('bGen').onclick = async () => {
+  if (mode === 'champ') exitChamp();
+  if (!tr) return;
+  mode = 'train'; genTarget = true; setRunning(true);
+};
+el('bReset').onclick = async () => { setRunning(false); exitChamp(); mode = 'idle'; await buildTrainer(); };
+el('bChamp').onclick = () => { if (mode === 'champ') exitChamp(); else enterChamp(); };
+el('bFollow').onclick = () => { followOn = !followOn; applyFollow(); };
+for (const id of ['selPop', 'selSteps', 'inSeed', 'selPrey'])
+  el(id).onchange = async () => { setRunning(false); exitChamp(); mode = 'idle'; await buildTrainer(); };
+el('bCopy').onclick = async () => {
+  const h = tr ? tr.history : [];
+  let sum = `Kraken-Training · Build ${el('build').textContent} · Backend ${el('backend').textContent}\n`;
+  sum += `Parameter: ${JSON.stringify(uiOpts())}\n`;
+  if (h.length) {
+    sum += 'gen\tbest\tmean\tsigma\tdisp\tstrides\tanchor\tspin\n';
+    for (const r of h) sum += [r.gen, r.best.toFixed(2), r.mean.toFixed(2), r.sigma.toFixed(4),
+      r.disp.toFixed(2), r.strides.toFixed(2), (r.anchor * 100).toFixed(1) + '%', r.spin.toFixed(2)].join('\t') + '\n';
+  }
+  sum += '\n--- Log ---\n' + logText;
+  try { await navigator.clipboard.writeText(sum); say('Log + Verlauf in die Zwischenablage kopiert.'); }
+  catch { say('Kopieren nicht erlaubt (Clipboard-API blockiert).'); }
+};
+
+window.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.code === 'Space') { e.preventDefault(); el('bStart').click(); }
+  if (e.code === 'KeyG') el('bGen').click();
+  if (e.code === 'KeyC') el('bChamp').click();
+  if (e.code === 'KeyR') el('bReset').click();
+});
+</script>
+</body>
+</html>

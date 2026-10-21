@@ -31,7 +31,7 @@ jobs:
       # buildless und ohne package.json, die Abhängigkeit lebt nur in der CI.
       - name: WGSL-Compiler holen (naga-wasm, optional für lokal)
         run: npm i --no-save naga-wasm@30.2.0
-      - name: Abnahme-Checks (66)
+      - name: Abnahme-Checks (71)
         run: node tools/harness.js
       - name: Shader-Compile explizit
         run: node tools/compile-wgsl.js
@@ -47,10 +47,11 @@ jobs:
       - name: Artefakt vorbereiten
         run: |
           mkdir -p site
-          cp -r index.html gpu.html gpu-min.html .nojekyll src site/
+          cp -r index.html gpu.html gpu-min.html train.html .nojekyll src site/
           test -f site/index.html || (echo "::error::index.html fehlt" && exit 1)
           test -f site/gpu.html || (echo "::error::gpu.html fehlt" && exit 1)
           test -f site/gpu-min.html || (echo "::error::gpu-min.html fehlt" && exit 1)
+          test -f site/train.html || (echo "::error::train.html fehlt" && exit 1)
           test -f site/src/gpu/solver.wgsl || (echo "::error::Shader fehlt" && exit 1)
           test -f site/src/sim/core.js || (echo "::error::src/sim/core.js fehlt" && exit 1)
           test -f site/src/sim/gputrain.js || (echo "::error::src/sim/gputrain.js fehlt" && exit 1)
