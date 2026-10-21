@@ -1141,6 +1141,11 @@ if (want('map')) {
 }
 
 // ══════════════════════════════════════════════════════════════
+// Wurde der naga-Compile übersprungen (lokal ohne naga-wasm)? Dann zählt
+// dieser Lauf einen Check weniger als die CI — die Check-Zahl-Vergleich im
+// V1-Abschnitt darf in dem Fall nicht zuschlagen.
+let wgslCompileSkipped = false;
+
 section('CHECK 12 — WGSL/Binding-Konsistenz (statisch, ohne GPU)');
 if (want('wgsl')) {
   const { execFileSync } = await import('node:child_process');
@@ -1166,6 +1171,7 @@ if (want('wgsl')) {
     let info = null;
     try { info = JSON.parse(out); } catch { /* SKIP-Ausgabe ist kein JSON */ }
     if (code === 3) {
+      wgslCompileSkipped = true;
       console.log('  ⚪ wgsl-compile  SKIP — naga-wasm nicht installiert (npm i --no-save naga-wasm@30.2.0; die CI hat es)');
     } else {
       check('wgsl-compile', 'solver.wgsl compiliert: naga parst, validiert, serialisiert zurück',
@@ -1232,8 +1238,18 @@ if (want('viewer')) {
           : 'Workflow kopiert/verifiziert train.html nicht');
   const stampOk = ih.includes('__BUILD_SHA__') && th.includes('__BUILD_SHA__')
     && !ih.includes('57da2d4') && !th.includes('57da2d4');
-  check('build-stamps', 'index.html/train.html tragen __BUILD_SHA__ (bust-cache füllt ihn, kein Handstempel)',
-    stampOk, stampOk ? 'beide Seiten nutzen den Platzhalter' : 'Seite nutzt einen von Hand gebackenen Stempel');
+  // Der Viewer darf keine veraltete Check-Zahl bewerben: „36/36" stand noch
+  // nach zwei Revisionen im Text, und „70/70" wurde in genau dem Commit
+  // geschrieben, der auf 71 ging. Vergleich nur im vollen Lauf mit naga —
+  // sonst wäre die Soll-Zahl um den SKIPped wgsl-compile verfälscht.
+  const shown = ih.match(/\b(\d+)\/(\d+) Checks\b/);
+  const countAssert = !only && !wgslCompileSkipped && shown;
+  const countOk = !countAssert || (shown[1] === shown[2] && parseInt(shown[1], 10) === results.length + 1);
+  check('build-stamps', 'index.html/train.html tragen __BUILD_SHA__ und die aktuelle Check-Zahl',
+    stampOk && countOk,
+    !stampOk ? 'Seite nutzt einen von Hand gebackenen Stempel'
+      : countOk ? `Platzhalter ok; Viewer nennt ${shown[0]} = dieser Lauf (${results.length + 1})`
+                : `Viewer nennt ${shown[0]}, dieser Lauf zählt ${results.length + 1} — Text ist veraltet`);
 }
 
 section('ZUSAMMENFASSUNG');
