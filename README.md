@@ -518,11 +518,20 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
 
    | Variante (headlos, `tools/class-spread.mjs`) | maxΔ | Grip-Flags | pathLen | Fitness |
    |---|---|---|---|---|
-   | f32, Kollision in CPU-Ordnung | **0.36 px** | 100.00 % | **+0.01 %** | -0.00 % |
-   | f32 + Race, letzter Punkt gewinnt | 29.77 px | 99.44 % | -14.71 % | -3.27 % |
-   | f32 + Race, erster Punkt gewinnt | 51.10 px | 99.35 % | -21.83 % | -3.94 % |
-   | f32 + Jacobi (alle Deltas summiert) | 30.54 px | 99.27 % | -15.34 % | -3.69 % |
+   | f32, Kollision in CPU-Ordnung | **0.36 px** | 100.00 % | **+0.01 %** | **-0.01 %** |
+   | f32 + Race, letzter Punkt gewinnt | 29.77 px | 99.44 % | -14.71 % | -14.77 % |
+   | f32 + Race, erster Punkt gewinnt | 51.10 px | 99.35 % | -21.83 % | -20.39 % |
+   | f32 + Jacobi (alle Deltas summiert) | 30.54 px | 99.27 % | -15.34 % | -11.13 % |
    | **echte RTX 3070 Ti (G7, Build 529fdc7)** | **22.02 px** | **99.35 %** | **-14.80 %** | — |
+
+   maxΔ, Grip-Flags und pathLen sind Physik und blieben über die Fitness-
+   Revision exakt gleich; die Fitness-Spalte ist mit der revidierten Fitness
+   neu gemessen (`6d80abb`). Sie folgt jetzt der pathLen-Spalte statt von ihr
+   abzuweichen (-14.71 % pathLen → -14.77 % Fitness, vorher -3.27 %): die
+   ungetorrten Verhältnis-Terme hatten die Abweichung vorher verdünnt.
+   Seed 13 zur Einordnung derselben race-freien Emulation: 1.09 px, 98.95 %
+   Flags, +0.23 % pathLen, +0.49 % Fitness — die G7-Tore sind auf Seed 7
+   kalibriert, weil gpu.html G7 mit Seed 7 läuft.
 
    Die Race-Zeile trifft die Hardware-Messung (pathLen -14.71 vs -14.80 %,
    Flags 99.44 vs 99.35 %), race-frei bleibt **40× darunter**. Es war also
