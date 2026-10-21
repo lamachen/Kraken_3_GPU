@@ -66,8 +66,8 @@ const counters = {};
 const backend = BACKEND === 'passthrough' ? passthroughBackend(tr.sim, counters) : f32mockBackend(w);
 
 console.log(`mocktrain: ${GENS} Gen × ${POP} Tiere × ${STEPS} Schritte, Backend=${backend.kind}, prey=${PREY}, seed=${SEED}`);
-console.log(' gen |   best |   mean | Anker | Zug-px | Zyklen | gerade | s/Gen');
-console.log('-----+--------+--------+-------+--------+--------+--------+------');
+console.log(' gen |   best |   mean | Anker | Zug-px | Zyklen | Schritte | gerade | s/Gen');
+console.log('-----+--------+--------+-------+--------+--------+----------+--------+------');
 const t00 = Date.now();
 let lastGen = 0;
 for (let g = 0; g < GENS; g++) {
@@ -79,7 +79,7 @@ for (let g = 0; g < GENS; g++) {
   console.log(
     String(g).padStart(4) + ' | ' + r.best.toFixed(2).padStart(6) + ' | ' + r.mean.toFixed(2).padStart(6)
     + ' | ' + (r.anchor * 100).toFixed(0).padStart(4) + '% | ' + r.gripPull.toFixed(0).padStart(6)
-    + ' | ' + r.cycles.toFixed(2).padStart(6) + ' | ' + r.straight.toFixed(2).padStart(6)
+    + ' | ' + r.cycles.toFixed(2).padStart(6) + ' | ' + r.strides.toFixed(1).padStart(8) + ' | ' + r.straight.toFixed(2).padStart(6)
     + ' | ' + lastGen.toFixed(1).padStart(5));
 }
 const total = (Date.now() - t00) / 1000;

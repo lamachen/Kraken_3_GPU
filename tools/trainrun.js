@@ -2,22 +2,22 @@
 /**
  * Trainingslauf: die einzige Messung, die wirklich zählt.
  *
- *   node tools/trainrun.js [--gens 20] [--pop 32] [--steps 500] [--prey 0]
+ *   node tools/trainrun.js [--gens 20] [--pop 32] [--steps 500] [--prey 0] [--seed 7]
  */
 import { createTrainer, beginGeneration, trainStep, endGeneration, N_IN, N_W } from '../src/sim/train.js';
 import { OUT_DIM, HIDDEN } from '../src/brain/net.js';
 
 const argv = process.argv.slice(2);
 const arg = (n, d) => { const i = argv.indexOf('--' + n); return i >= 0 ? Number(argv[i + 1]) : d; };
-const GENS = arg('gens', 20), POP = arg('pop', 32), STEPS = arg('steps', 500), PREY = arg('prey', 0);
+const GENS = arg('gens', 20), POP = arg('pop', 32), STEPS = arg('steps', 500), PREY = arg('prey', 0), SEED = arg('seed', 7);
 
-console.log(`Training: ${GENS} Generationen, Population ${POP} (=${POP >> 1} gespiegelte Paare), ${STEPS} Schritte/Gen, ${PREY} Beute`);
+console.log(`Training: ${GENS} Generationen, Population ${POP} (=${POP >> 1} gespiegelte Paare), ${STEPS} Schritte/Gen, ${PREY} Beute, Seed ${SEED}`);
 console.log(`Netz: ${N_IN} Eingänge → ${HIDDEN} → ${HIDDEN} → ${OUT_DIM}  =  ${N_W} Gewichte`);
 console.log(`Evaluationsbudget: ${POP} Genome/Gen bei ${N_W} Gewichten = ${(N_W / POP).toFixed(0)}:1   (Kraken_v2: 55:1)\n`);
-console.log(' gen |   best |   mean | sigma | Zug-px | Anker | netto | gerade | Zyklen | Umdreh |  Eff  | s/Gen');
-console.log('-----+--------+--------+-------+--------+-------+-------+--------+--------+--------+-------+------');
+console.log(' gen |   best |   mean | sigma | Zug-px | Anker | netto | gerade | Zyklen | Schritte | Umdreh |  Eff  | s/Gen');
+console.log('-----+--------+--------+-------+--------+-------+-------+--------+--------+----------+--------+-------+------');
 
-const tr = createTrainer({ popSize: POP, stepsPerGen: STEPS, seed: 7, prey: PREY });
+const tr = createTrainer({ popSize: POP, stepsPerGen: STEPS, seed: SEED, prey: PREY });
 const hist = [];
 const t00 = Date.now();
 for (let g = 0; g < GENS; g++) {
@@ -32,6 +32,7 @@ for (let g = 0; g < GENS; g++) {
     ' | ' + r.sigma.toFixed(4) + ' | ' + r.gripPull.toFixed(0).padStart(6) +
     ' | ' + (r.anchor * 100).toFixed(0).padStart(4) + '% | ' + r.disp.toFixed(0).padStart(5) +
     ' | ' + (r.straight * 100).toFixed(0).padStart(5) + '% | ' + r.cycles.toFixed(0).padStart(6) +
+    ' | ' + r.strides.toFixed(1).padStart(8) +
     ' | ' + r.spin.toFixed(2).padStart(6) + ' | ' + r.eff.toFixed(2).padStart(5) + ' | ' + dt.toFixed(1));
 }
 const total = (Date.now() - t00) / 1000;
@@ -50,7 +51,7 @@ const avg = (a, k) => a.reduce((s, x) => s + x[k], 0) / a.length;
 console.log('\n── Trend (lineare Regression über alle ' + GENS + ' Generationen) ──');
 for (const [k, label, unit] of [['best', 'Score (best)', ''], ['mean', 'Score (mean)', ''],
     ['gripPull', 'Zug-Strecke', 'px'], ['disp', 'Netto-Distanz', 'px'], ['anchor', 'Anker-Rate', ''],
-    ['straight', 'Geradlinigkeit', ''], ['cycles', 'Zugzyklen', ''], ['spin', 'Umdrehungen', '']]) {
+    ['straight', 'Geradlinigkeit', ''], ['cycles', 'Zugzyklen', ''], ['strides', 'Wechselgriffe', ''], ['spin', 'Umdrehungen', '']]) {
   const s = slope(hist.map(h => h[k]));
   const scale = (k === 'anchor' || k === 'straight') ? 100 : 1;
   const u = (k === 'anchor' || k === 'straight') ? '%' : unit;

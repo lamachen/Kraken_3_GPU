@@ -645,6 +645,94 @@ if (want('train')) {
     `${(a0 * 100).toFixed(0)} % → ${(a1 * 100).toFixed(0)} %`);
 }
 
+// ══════════════════════════════════════════════════════════════
+section('CHECK N4 — FITNESS: keine Fehlanreize (nach Messung revidiert)');
+if (want('fitness')) {
+  // Vier Controller, dieselbe Welt (Seed 31, 4 Tiere, 200 Schritte). Alle fünf
+  // Checks hier sind Regressionen gegen gemessene Fehlanreize der Fitness VOR der
+  // Revision (Build 175f8e7, dieselben Controller, dieselben Seeds — die
+  // „vorher"-Zahlen in den Details sind dort gemessen, nicht ausgedacht):
+  //   1. gripPullProg war nicht durch maxDisplacement beschränkt: Hin-und-zurück
+  //      wurde jedes Mal erneut bezahlt (pull/disp 2.73 beim kleinen Gang).
+  //   2. Stillstand war profitabel: `directed` und `headingHold` sind
+  //      Verhältnisse ohne Fortschritts-Schwelle („halten" = 30.9 Punkte).
+  //   3. Der gait-Term war blind (gripCycles verlangt null Anker in einem
+  //      Schritt) und damit ein toter Gradient — der Takt des Gangs kam in der
+  //      Fitness nicht vor.
+  const { score, scoreTerms, FIT_WEIGHTS } = await import('../src/sim/fitness.js');
+  const STEPS = 200, NC = 4;
+  const mkCtl = () => ({ tone: 0.5, emitEcho: false, arms: Array.from({ length: 6 }, () => ({ shoulder: 0, curl: 0, adhesion: 0 })) });
+  // Metachronale Welle: Standphase zieht, Schwungphase setzt um, Arme phasenverschoben.
+  const waveOf = (amp, T = 32) => (c, s, ctl) => {
+    ctl.tone = 0.9;
+    for (let a = 0; a < 6; a++) {
+      const u = (((s / T) + a / 6) % 1 + 1) % 1;
+      const st = u < 0.5, q = st ? u / 0.5 : (u - 0.5) / 0.5;
+      ctl.arms[a].shoulder = st ? amp * (1 - 2 * q) : amp * (2 * q - 1);
+      ctl.arms[a].curl = st ? -0.2 : 0.7;
+      ctl.arms[a].adhesion = st ? 1 : 0;
+    }
+    return ctl;
+  };
+  const hold = (c, s, ctl) => { ctl.tone = 0.5; for (const k of ctl.arms) { k.shoulder = 0; k.curl = 0; k.adhesion = 1; } return ctl; };
+  const thrash = (c, s, ctl) => {
+    ctl.tone = 0.9;
+    for (let a = 0; a < 6; a++) {
+      const ph = 2 * Math.PI * (s / 40) + a * 1.047;
+      ctl.arms[a].shoulder = 0.9 * Math.sin(ph); ctl.arms[a].curl = 0.5 * Math.sin(ph * 2); ctl.arms[a].adhesion = 1;
+    }
+    return ctl;
+  };
+  // Tretmühle: Adhäsion im Wechsel, aber LÖSEN und WIEDERGREIFEN im selben
+  // Schritt — 100+ Greif-Ereignisse ohne Reise. Der schärfste Farm-Versuch
+  // gegen den stride-Term.
+  const treadmill = (c, s, ctl) => {
+    ctl.tone = 0.5;
+    for (let a = 0; a < 6; a++) {
+      const u = (((s / 12) + (a % 2) * 0.5) % 1 + 1) % 1;
+      ctl.arms[a].shoulder = 0.03 * (u < 0.5 ? 1 : -1);
+      ctl.arms[a].curl = 0;
+      ctl.arms[a].adhesion = u < 0.5 ? 1 : 0;
+    }
+    return ctl;
+  };
+  function episode(fn) {
+    const sim = createSim({ seed: 31, creatures: NC, prey: 0 });
+    const ctl = mkCtl();
+    for (let s = 0; s < STEPS; s++) { for (const c of sim.creatures) applyControl(c, fn(c, s, ctl)); stepSim(sim); }
+    const cs = sim.creatures;
+    const mean = (f) => cs.reduce((a, c) => a + f(c), 0) / cs.length;
+    const terms = cs.map(c => scoreTerms(c, sim.opts));
+    const tm = (k) => terms.reduce((a, t) => a + t[k], 0) / terms.length;
+    return { cs, mean, tm, score: mean(c => score(c, sim.opts)), disp: mean(c => c.maxDisplacement),
+             path: mean(c => c.pathLen), pull: mean(c => c.gripPullProg), strides: mean(c => c.strides),
+             attach: mean(c => c.attachEvents),
+             ratchetOk: cs.every(c => c.gripPullProg <= c.maxDisplacement + 1e-9) };
+  }
+  const big = episode(waveOf(0.8)), small = episode(waveOf(0.2));
+  const still = episode(hold), zap = episode(thrash), mill = episode(treadmill);
+
+  check('fit-ratchet', 'gripPullProg ≤ maxDisplacement (Rattern zahlt nicht zweimal)',
+    big.ratchetOk && small.ratchetOk && zap.ratchetOk && mill.ratchetOk,
+    `kleiner Gang: ${small.path.toFixed(1)} px Weg → ${small.pull.toFixed(1)} px gutgeschrieben bei ${small.disp.toFixed(1)} px netto (vorher 30.3 px = 2.73× netto)`);
+  check('fit-static-floor', 'Stillstand ist nicht profitabel (< 10 % des Gangs)',
+    still.score < 10 && still.score < 0.10 * big.score,
+    `halten ${still.score.toFixed(1)} vs Gang ${big.score.toFixed(1)} Punkte = ${(100 * still.score / Math.max(1e-9, big.score)).toFixed(1)} % (vorher 30.9 vs 262.4 = 11.8 %)`);
+  check('fit-stride-farm', 'Adhäsions-Tretmühle ohne Reise: 0 gewertete Schritte',
+    mill.attach > 50 && mill.strides === 0 && mill.tm('stride') < 1 && mill.score < 5,
+    `${mill.attach.toFixed(0)} Greif-Ereignisse/Tier, ${mill.strides.toFixed(0)} strides, stride-Term ${mill.tm('stride').toFixed(2)}, Score ${mill.score.toFixed(1)} (vorher Score 31.0)`);
+  check('fit-stride-pays', 'Produktiver Wechselgang bekommt stride-Kredit',
+    big.strides >= 10 && big.tm('stride') >= 10,
+    `${big.strides.toFixed(0)} Schritte/Tier bei ${big.disp.toFixed(1)} px netto → stride-Term ${big.tm('stride').toFixed(1)} Punkte (Deckel: strideBonus ${FIT_WEIGHTS.strideBonus} × Fortschrittsbasis, cap ${FIT_WEIGHTS.strideCap})`);
+  // Die Fitness muss die REISE abbilden, nicht irgendetwas, das sich gut anfühlt:
+  // das Score-Verhältnis zweier Gänge soll ihr Distanz-Verhältnis treffen.
+  const scoreRatio = big.score > 0 ? small.score / big.score : 0;
+  const dispRatio = big.disp > 0 ? small.disp / big.disp : 0;
+  check('fit-ranks-travel', 'Score-Verhältnis folgt dem Distanz-Verhältnis (±0.15)',
+    big.score > small.score && small.score > zap.score && zap.score > still.score && Math.abs(scoreRatio - dispRatio) < 0.15,
+    `Score ${scoreRatio.toFixed(2)} vs Distanz ${dispRatio.toFixed(2)} (vorher 0.71 vs 0.34 — der kleine Gang war fast so viel wert wie der große)`);
+}
+
 section('CHECK G8 — HYBRID-TRAINER: Spiegel-Feldmapping + Passthrough-Identität (M3c)');
 if (want('gputrain')) {
   const { mirrorInto, packControls, GPU_STRIDES } = await import('../src/gpu/gpuworld.js');

@@ -62,13 +62,15 @@ src/gpu/solver.wgsl    WGSL-Port des Solvers (Jacobi, f32, sequentielle Farb-Dis
 src/gpu/gpuworld.js    Buffer/Bind-Groups, upload/packControls, step, download/mirrorInto.
 src/sim/gputrain.js    Hybrid-Trainer: Physik GPU, Sinne/Netz/ES CPU, Zustandsspiegel.
 src/render/            EINZIGE DOM-abhängige Schicht (view.js) + Platzhalter-Gang (demo.js).
-tools/harness.js       61 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
+tools/harness.js       66 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
 tools/profile-step.js  Zerlegt den Tier-Schritt in Phasen (µs) — Architektur-Entscheide.
 tools/mocktrain.js     Hybrid-Trainer headless ohne Device (Passthrough/f32-Mock).
 tools/f32solver.mjs    f32-Solver-Emulation (WGSL-Semantik per-op, 4 Kollisions-Modi).
 tools/class-spread.mjs Misst die Solver-Divergenz pro Störvariante — fand den Kollisions-Race.
 tools/collprobe.mjs    Misst, was der Race physikalisch anrichtet (verworfene Korrekturen, Rest-Penetration).
 tools/compile-wgsl.js  Echter WGSL-Compile (naga als WASM) — optional, in der CI Pflicht.
+tools/gaitprobe.mjs    Misst den Gang: Greif-Ereignisse pro Arm gegen das, was score() sieht.
+tools/strideprobe.mjs  Skript-Gänge gegen das trainierte Netz — physikalischer Kopfraum.
 tools/*-probe.mjs      Messproben: Lyapunov, Injektion, Bruch-Timing, Ordnung, f32-Parität.
 ```
 
@@ -130,7 +132,7 @@ voll gestellt   (900 N Grenze)  → hält unter demselben Zug
 ## Abnahme: `node tools/harness.js`
 
 ```
-61/61 Checks bestanden
+66/66 Checks bestanden
   passiv        exakt in Ruhe            Pfad 0.00e+0 px        (v2: 964 px)
   slack-fixpoint Störung < slack         Δ = 0.00e+0 px, v = 0  (f32-Boden: GPU driftete 1.28 px)
   slack-corrects 25× slack korrigiert    0.050 px → 1.95e-3 px
@@ -143,6 +145,10 @@ voll gestellt   (900 N Grenze)  → hält unter demselben Zug
   f32-class      f32-Emulation race-frei: maxΔ 0.78 px, pathLen +0.24 %, NaN 0
   coll-race-repro Kollisions-Race reproduziert die GPU-Divergenz: 74.5 px vs 0.78 px race-frei
   coll-race-physics Physik dahinter: 28.4 % Korrekturen verworfen, 5.80× Rest-Penetration
+  fit-ratchet    Rattern zahlt nicht zweimal 129.7 px Weg → 11.1 px gutgeschrieben (vorher 30.3)
+  fit-static-floor Stillstand lohnt nicht    halten −0.1 vs Gang 186.7 Punkte (vorher 30.9 vs 262.4)
+  fit-stride-farm Adhäsions-Tretmühle       102 Greif-Ereignisse → 0 gewertete Schritte
+  fit-ranks-travel Score folgt der Distanz   Verhältnis 0.33 vs 0.34 (vorher 0.71 vs 0.34)
   color-order-free Ordnung innerhalb einer Farbklasse ist frei: maxΔ 0.00e+0 — GPU-Dispatch exakt
   coll-grouping    groupCollPoints + Shader-Weg = _solveCollisions: 128 Posen, 26 356 Kontakte, Δ = 0
   wgsl-compile     solver.wgsl compiliert wirklich (naga 30 als WASM), nicht nur Textvergleich
@@ -233,7 +239,8 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
    53 MB plus Eigenzerlegung pro Generation). Fitness nach den drei v2-Regeln:
    nur Netto-Fortschritt, lageunabhängig, jeder Term einzeln nicht farmbar.
 
-   **Gemessener Trainingslauf** (32 Tiere, 500 Schritte/Gen, 20 Generationen, 91 s):
+   **Gemessener Trainingslauf** (32 Tiere, 500 Schritte/Gen, 20 Generationen, 91 s;
+   Fitness-Stand VOR der Revision unten — Score-Zahlen sind nicht vergleichbar):
 
    | | Start | Ende | Trend/Gen |
    |---|---|---|---|
@@ -246,11 +253,102 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
    Projekt, das nachweislich gelernt wurde** — in Kraken_v2 kam die Anker-Rate
    über 12 % nie hinaus.
 
-   Bekannte Grenze: `Zugzyklen ≈ 1`. Die ES findet sofort „einmal festhalten und
-   nie mehr loslassen"; höhere `gait`-Gewichte ändern das nicht. Der Grund ist
-   dynamisch: Loslassen erfordert Adhäsion < 0.04 auf allen sechs Armen
-   gleichzeitig, und danach müssen die Spitzen für den Re-Grip unter 150 px/s
-   liegen — während der Körper gerade driftet.
+   ── Die „bekannte Grenze `Zugzyklen ≈ 1`" war falsch diagnostiziert ──────
+
+   Behauptet war: die ES finde „einmal festhalten und nie mehr loslassen", der
+   Grund sei dynamisch (Adhäsion < 0.04 auf allen sechs Armen gleichzeitig,
+   danach Re-Grip unter 150 px/s). Gemessen (`tools/gaitprobe.mjs`, 6 Gen ×
+   32 Tiere × 500 Schritte, seed 7): im Schnitt haften **2.33 von 6 Armen**,
+   **79 %** aller Greif-Ereignisse sind Wechselgriffe, Ø Haltezeit 10.2 Schritte,
+   längste 126. Es wird also sehr wohl umgesetzt — nur nie *alles gleichzeitig*,
+   und genau das verlangte `gripCycles`: nur **0.46 %** der Schritte haben null
+   Anker. Der gait-Term trug **4.2 von 360** möglichen Punkten (1.4 % des
+   Scores). Ein toter Gradient, kein statisches Verhalten.
+
+   Beim Nachmessen mit Skript-Gängen (`tools/strideprobe.mjs`: 14 getaktete
+   Controller, jeweils frische Trainer mit gleichem Seed ⇒ identische Welt,
+   identische 32 Spawns, nur der Controller anders) sind zwei weitere
+   Fehlanreize aufgefallen — beide Verletzungen von Regel 1 und Regel 3:
+
+   | Fitness vor der Revision | `wave T=16` | `halten` | `zappeln` | trainiertes Netz |
+   |---|---|---|---|---|
+   | netto | 28.3 px | 9.1 px | 13.1 px | 16.3 px |
+   | Weg | 342 px | 15 px | 228 px | 25 px |
+   | „Zug" (`gripPullProg`) | **126.9 px** | 9.8 px | 57.7 px | 12.7 px |
+   | Score | **453.9** (Platz 1) | 104.4 | 255.8 | 149.8 |
+
+   • **Rattern war farmbar.** `gripPullProg` summierte jeden Anstieg des
+     Spawn-Abstands — also auch den zweiten Vorstoß nach einem Zurückrutschen.
+     4.5× mehr „Zug" als Netto-Distanz, und dieser eine Term trug 330 von 454
+     Punkten: Der höchste Score der ganzen Sweep-Tabelle gehörte einem Tier,
+     das 28 px weit kam.
+   • **Stillstand war profitabel.** `directed` (Netto/Weg) und `headingHold`
+     sind Verhältnisse ohne Fortschritts-Schwelle und damit durch Nichtstun
+     maximierbar. Ein toter Krake scored 104.4, ein zappelnder 255.8 — das
+     trainierte Netz nach 6 Generationen ES: 149.8. Eine Policy schlechter als
+     ein toter Krake war fitness-optimal.
+
+   **Revision** (`src/sim/fitness.js` + `postStep()`, gepinnt von 5 neuen
+   Harness-Checks, `node tools/harness.js --only fitness`):
+
+   1. **Ratchet**: `gripPullProg` zählt nur noch neue Maxima des Spawn-Abstands
+      ⇒ `gripPullProg ≤ maxDisplacement`, geprüft über alle 17 Konfigurationen
+      der Sonde.
+   2. **`progGate`** = `min(1, disp / (0.25 · spawnReach))` multipliziert alle
+      Qualitätsterme (`directed`, `headingHold`, `meanSpeed`, `efficiency`).
+      Fortschrittsterme und Strafterme bleiben ungetorrt.
+   3. **`gait` → `stride`**: `postStep()` zählt Wechselgriffe pro Arm mit
+      durchgehender Abstützung (`c.strides` — ein Arm fasst neu, während ein
+      anderer ÜBER den Schritt hinweg hält). Multiplikativ auf die
+      Fortschrittsbasis: `stride = (gripPull + reach) · 0.5 · min(strides, 60)/60`.
+      `scoreTerms()` ist exportiert, damit „Score 418" nicht mehr unkommentiert
+      im Raum steht.
+
+   Wirkung auf dieselben Controller (500 Schritte, 32 Spawns):
+
+   | | `wave T=32` | `sync T=16` | `wave T=16` (Ratterer) | `zappeln` | `halten` |
+   |---|---|---|---|---|---|
+   | netto | 59.3 px | **64.4 px** | 28.3 px | 13.1 px | 9.1 px |
+   | Score vorher | 430.3 | 341.9 | **453.9** ← Platz 1 | 255.8 | 104.4 |
+   | Score nachher | **380.7** ← Platz 1 | 337.3 | 181.8 | 61.0 | 44.4 |
+
+   Platz 1 nach Score ist jetzt derselbe Gang wie Platz 1/2 nach Distanz, der
+   Stillstands-Boden ist von 104.4 auf 44.4 gefallen (bei 200 Schritten: auf
+   −0.1), und das Score-Verhältnis zweier Gänge trifft ihr Distanz-Verhältnis
+   auf **0.33 gegen 0.34** (vorher 0.71 gegen 0.34).
+
+   **Der stride-Term additiv war eine Falle — gemessen.** Der erste Entwurf
+   rechnete `min(strides,60) · 2.2 · progGate` additiv. Ergebnis nach 20
+   Generationen: 75 Wechselgriffe pro Episode bei nur 22.7 px netto — die ES
+   hatte den leichteren der beiden Wege genommen (Takt statt Reise). Erst
+   multiplikativ auf den Fortschritt ist der Term nicht mehr gegen die Reise
+   auszuspielen.
+
+   **A/B über drei Seeds** (20 Gen × 32 Tiere × 500 Schritte, prey 2,
+   `node tools/trainrun.js --seed …`):
+
+   | | Seed 7 | Seed 13 | Seed 21 | Ø |
+   |---|---|---|---|---|
+   | netto-px, Fitness **vor** der Revision | 38.2 | 22.2 | 20.9 | **27.1** |
+   | netto-px, Fitness **nach** der Revision | 29.9 | 22.3 | 19.4 | **23.9** |
+   | Anker-Rate nach der Revision | 89 % | 98 % | 100 % | 96 % |
+   | Wechselgriffe/Episode nach der Revision | 67.2 | 76.3 | 33.3 | **58.9** |
+   | `gripCycles` (alte, blinde Metrik) vorher | 1 | 10 | 1 | 4 |
+
+   Die Netto-Distanz ist innerhalb der Seed-Streuung gleich geblieben (die
+   38.2 px des Seed-7-Laufs sind ein Ausreißer — dieselbe Fitness liefert auf
+   Seed 13/21 nur 22.2/20.9 px), der Gang ist neu da: **1 Zyklus → 33–76
+   Wechselgriffe pro Episode**. Nebenbefund, der für alle künftigen Messreihen
+   gilt: **Ein Einseed-Lauf ist in diesem Projekt keine Evidenz.** Die Streuung
+   über drei Seeds (20.9…38.2 px) ist größer als jeder Effekt, den die
+   Fitness-Revision hatte.
+
+   Offen bleibt damit die **Suche**, nicht die Belohnung: der beste Skript-Gang
+   kommt 64.4 px weit, das trainierte Netz 24–30 px — 3.4× physikalischer
+   Kopfraum, den die ES nicht hebt, weil sie die Phasenversetzung zwischen sechs
+   Armen erst entdecken müsste. Die handgeschriebene Gangkurve bleibt trotzdem
+   draussen (v2: Trend −9.34 px/Gen MIT Kurve gegen +5.14 ohne); die Sonde ist
+   ein Messstand, kein Produktbestandteil.
 4. **[fertig: 3b — 11/11 im Browser validiert] GPU-Portierung.**
    `src/gpu/solver.wgsl` ist ein 1:1-Port des CPU-Lösers (integrieren →
    Constraint-Iterationen → Kollision → Abschluss → Grip-Bruch), `src/gpu/gpuworld.js`
@@ -391,6 +489,14 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
    Abschnitt). G8-Zahlen sind vor dem Fix gemessen und gelten weiterhin: der
    Race betraf die Kollisionskorrektur, nicht den Durchsatz.
 
+   **Achtung beim Vergleichen mit neuen Logs:** alle Score-, Anker- und
+   Zyklus-Zahlen in diesem Abschnitt sind mit der Fitness VOR der Revision aus
+   Punkt 3 gemessen. `score()` hat seitdem ein Ratchet, ein `progGate` und
+   `stride` statt `gait` — Score-Werte und „Zyklen" sind zwischen den Builds
+   nicht vergleichbar, wohl aber der Durchsatz (Tier-Schritte/s) und die
+   Netto-Distanz in px. gpu.html meldet seit der Revision zusätzlich
+   `Wechselgriffe` pro Tier.
+
    **Die vermeintlichen „zwei Fehlerklassen" — und was wirklich dahinter war.**
    Build `529fdc7` erklärte die G7-Abweichung mit Chaos: die Dynamik sei
    kontraktiv gegen Zustandsstörungen, aber chaotisch gegen Solver-Internika
@@ -498,7 +604,7 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
 ## Lokal
 
 ```bash
-node tools/harness.js          # 61 Abnahme-Checks
+node tools/harness.js          # 66 Abnahme-Checks
 node tools/harness.js --only chaos          # G7-Fehlerklassen (absorbiert vs chaotisch)
 node tools/check-wgsl.js       # Shader/Binding-Konsistenz (Textvergleich, ohne GPU)
 npm i --no-save naga-wasm@30.2.0 && node tools/compile-wgsl.js   # echter WGSL-Compile
@@ -508,6 +614,9 @@ node tools/mocktrain.js --gens 8            # Hybrid-Trainer headless (f32-Mock)
 node tools/f32parity-probe.mjs              # f64-Oracle vs f32-Solver-Emulation
 node tools/class-spread.mjs --pop 32 --seeds 7,13 --variants ctrl,f32,f32race
 node tools/collprobe.mjs                    # Physik des Kollisions-Race (4 s)
+node tools/gaitprobe.mjs --gens 6           # Gang: Ereignisse pro Arm vs. Fitness-Sicht (30 s)
+node tools/strideprobe.mjs                  # Skript-Gänge vs. trainiertes Netz (110 s)
+node tools/harness.js --only fitness        # die 5 Fehlanreiz-Regressionen der Fitness
 python3 -m http.server 8080    # oder: npx serve .   → http://localhost:8080
 ```
 

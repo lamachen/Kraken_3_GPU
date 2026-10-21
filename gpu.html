@@ -565,7 +565,7 @@ say('\n--- G8 Training auf GPU ---');
   const backend = gpuBackend(gpu);
   const t1 = performance.now();
   const hist = await runGpuTraining(trG, backend, GENS, STEPS, (r, g) => {
-    say(`  GPU-Gen ${g}: best ${r.best.toFixed(2)} mean ${r.mean.toFixed(2)} Anker ${(r.anchor * 100).toFixed(0)} % Zug ${r.gripPull.toFixed(0)} px Zyklen ${r.cycles.toFixed(2)}`);
+    say(`  GPU-Gen ${g}: best ${r.best.toFixed(2)} mean ${r.mean.toFixed(2)} Anker ${(r.anchor * 100).toFixed(0)} % Zug ${r.gripPull.toFixed(0)} px Zyklen ${r.cycles.toFixed(2)} Wechselgriffe ${r.strides.toFixed(1)}`);
   });
   const gpuMs = performance.now() - t1;
   const gpuRate = (POP * GENS * STEPS) / (gpuMs / 1000);

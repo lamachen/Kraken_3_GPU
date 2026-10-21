@@ -88,8 +88,10 @@ function makeCreature(world, k, map, opts, index) {
     prevVx: 0, prevVy: 0, ax: 0, ay: 0,
     pathLen: 0, maxDisplacement: 0, angularAccum: 0, forwardProg: 0,
     gripPullProg: 0, anchoredSteps: 0, anchoredSum: 0, gripCycles: 0,
+    strides: 0, attachEvents: 0, spawnDistMax: 0,
+    armWasAnchored: new Uint8Array(k.arms.length),
     freeMove: 0, energySpent: 0, hits: 0, preyMinDist: Infinity, spawnReach: 300,
-    wasAnchored: false, prevSpawnDist: 0, steps: 0,
+    wasAnchored: false, steps: 0,
     meanExtension: 1, meanCurl: 0,
   };
 }
@@ -308,13 +310,19 @@ export function postStep(c) {
 
   const anchored = c.arms.reduce((n, a) => n + (a.grip.broken ? 0 : 1), 0);
   c.anchoredSum += anchored;
+  const dSpawn = Math.hypot(c.x - c.spawn.x, c.y - c.spawn.y);
   if (anchored > 0) {
     c.anchoredSteps++;
-    const dSpawn = Math.hypot(c.x - c.spawn.x, c.y - c.spawn.y);
-    if (dSpawn > c.prevSpawnDist) c.gripPullProg += dSpawn - c.prevSpawnDist;
-    c.prevSpawnDist = dSpawn;
-  } else {
-    c.prevSpawnDist = Math.hypot(c.x - c.spawn.x, c.y - c.spawn.y);
+    // Ratchet: nur NEUE Maxima zählen, nicht jeder Anstieg gegen den
+    // Vorschritt. Vorher summierte `dSpawn > prevSpawnDist` jede Vorwärtsbewegung
+    // auf — wer 10 px hinaus und wieder zurück ruderte, kassierte beim nächsten
+    // Hinaus erneut. Gemessen (tools/strideprobe.mjs, 500 Schritte, 32 Tiere):
+    // der getaktete Gang `wave T=16` machte 126.9 px „Zug" aus 28.3 px Netto
+    // (4.5×) und dieser eine Term trug 330 von 454 Fitness-Punkten. Regel 1
+    // („nur Netto-Fortschritt zählt") gilt damit auch hier: gripPullProg ist
+    // durch maxDisplacement beschränkt und nur noch über echten Raumgewinn
+    // zu haben — und zwar über Raumgewinn, der WÄHREND eines Halts passiert.
+    if (dSpawn > c.spawnDistMax) { c.gripPullProg += dSpawn - c.spawnDistMax; c.spawnDistMax = dSpawn; }
   }
   if (anchored === 0 && stepDist > 0.3) c.freeMove += stepDist;
   // Energie: Muskeltonus und Haftstärke kosten, Bewegung kostet.
@@ -323,7 +331,27 @@ export function postStep(c) {
   c.energySpent += (c.tone * 0.0006 + stepDist * 0.0004) * c.arms.length;
   if (anchored > 0 && !c.wasAnchored) c.gripCycles++;
   c.wasAnchored = anchored > 0;
-  c.maxDisplacement = Math.max(c.maxDisplacement, Math.hypot(c.x - c.spawn.x, c.y - c.spawn.y));
+
+  // ── Wechselgriff PRO ARM (stride) ────────────────────────────────
+  // `gripCycles` zählt den Übergang „ALLE Arme lose" → „einer hält". Ein
+  // Wechselgang produziert den nie: gemessen (tools/gaitprobe.mjs) haften im
+  // Schnitt 2.33 von 6 Armen, nur 0.46 % der Schritte haben null Anker, und
+  // 79 % der Greif-Ereignisse sind Wechselgriffe. Der gait-Term der Fitness war
+  // dadurch ein toter Gradient (4.2 von 360 möglichen Punkten = 1.4 % des
+  // Scores) — die README-Behauptung „einmal festhalten und nie mehr loslassen"
+  // war falsch: es wird umgesetzt, die Metrik hat es nur nicht gesehen.
+  // Ein stride zählt, wenn ein Arm NEU fasst, während mindestens ein anderer
+  // durchgehend hält. Reines Adhäsions-Zappeln aus dem Null-Halt heraus zählt
+  // nicht (dann ist anchored − newlyAttached = 0).
+  let newly = 0;
+  for (let a = 0; a < c.arms.length; a++) {
+    const now = c.arms[a].grip.broken ? 0 : 1;
+    if (now && !c.armWasAnchored[a]) { newly++; c.attachEvents++; }
+    c.armWasAnchored[a] = now;
+  }
+  if (newly > 0 && anchored - newly > 0) c.strides += newly;
+
+  c.maxDisplacement = Math.max(c.maxDisplacement, dSpawn);
   return stepDist;
 }
 

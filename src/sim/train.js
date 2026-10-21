@@ -135,8 +135,9 @@ function respawnCreature(sim, c, x, y, angle) {
   c.x = x; c.y = y; c.spawn = { x, y, angle };
   c.pathLen = 0; c.maxDisplacement = 0; c.angularAccum = 0; c.forwardProg = 0;
   c.gripPullProg = 0; c.anchoredSteps = 0; c.anchoredSum = 0; c.gripCycles = 0;
+  c.strides = 0; c.attachEvents = 0; c.spawnDistMax = 0; c.armWasAnchored.fill(0);
   c.freeMove = 0; c.energySpent = 0; c.hits = 0; c.preyMinDist = Infinity;
-  c.wasAnchored = false; c.prevSpawnDist = 0; c.steps = 0;
+  c.wasAnchored = false; c.steps = 0;
   c.prevVx = 0; c.prevVy = 0; c.contact.fill(0);
   for (const s of [c.echo]) { s.range_.fill(0); s.intensity.fill(0); s.pending.length = 0; s.cooldown = 0; }
   c.chem.smoothed.fill(0); c.chem.values.fill(0); c.chem.peak = 0;
@@ -196,6 +197,8 @@ export function endGeneration(tr) {
     disp: avg(c => c.maxDisplacement),
     straight: avg(c => c.pathLen > 1 ? c.maxDisplacement / c.pathLen : 0),
     cycles: avg(c => c.gripCycles),
+    strides: avg(c => c.strides),
+    attaches: avg(c => c.attachEvents),
     spin: avg(c => c.angularAccum / (Math.PI * 2)),
     eff: avg(c => c.forwardProg / Math.max(0.5, c.energySpent)),
   };
