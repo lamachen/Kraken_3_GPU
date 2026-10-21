@@ -24,8 +24,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
-      - name: Abnahme-Checks (22)
+      # naga (der WGSL-Übersetzer aus wgpu) als WASM — echter Compile-Check des
+      # Shaders. Ohne ihn ist check-wgsl.js reine Textvergleichung: ein
+      # `let cnt`, das in einer Schleife dekrementiert wird, parst dort fine
+      # und crasht erst im Browser des Benutzers. --no-save: das Repo bleibt
+      # buildless und ohne package.json, die Abhängigkeit lebt nur in der CI.
+      - name: WGSL-Compiler holen (naga-wasm, optional für lokal)
+        run: npm i --no-save naga-wasm@30.2.0
+      - name: Abnahme-Checks (60)
         run: node tools/harness.js
+      - name: Shader-Compile explizit
+        run: node tools/compile-wgsl.js
 
   deploy:
     needs: test

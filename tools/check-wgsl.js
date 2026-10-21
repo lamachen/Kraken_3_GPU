@@ -100,6 +100,49 @@ console.log('\n── Bindings ──');
   for (const n of jsB) if (!seen.has(n)) bad(`Layout definiert Binding ${n}, der Shader nutzt sie nicht`);
 }
 
+console.log('\n── Kollisions-Race (Regression gegen Build 529fdc7) ──');
+{
+  // URSACHE der G7-Divergenz, headless reproduziert (tools/class-spread.mjs):
+  // solveCollisions lief mit EINEM THREAD PRO KOLLISIONSPUNKT, aber Mantel (8
+  // Punkte) und Armsegmente (2 Punkte) teilen sich einen Körper — mehrere
+  // Threads lasen/korrigierten/schrieben dasselbe bodies[i]. Letzter gewinnt,
+  // der Rest der Korrektur geht verloren. Messung pop 32, seed 7, 150 Schritte:
+  //   f32 mit CPU-Kollisionsordnung  maxΔ  0.36 px · pathLen +0.01 %
+  //   f32 mit Race (letzter gewinnt) maxΔ 29.77 px · pathLen -14.71 %
+  //   echte RTX 3070 Ti              maxΔ 22.02 px · pathLen -14.80 %
+  // Fix: ein Thread pro Körper, seine Punkte sequentiell in CPU-Ordnung.
+  const perBody = /fn solveCollisions[\s\S]*?gid\.x;\s*if \(i >= P\.nBodies\)/.test(clean);
+  if (perBody) good('solveCollisions begrenzt auf P.nBodies — ein Thread pro Körper');
+  else bad('solveCollisions läuft nicht pro Körper (Schreib-Race über bodies[] möglich)');
+
+  const noPointDispatch = /solveCollisions\);\s*p\.setBindGroup\(0, g\.bindGroup\);\s*p\.dispatchWorkgroups\(disp\(g\.nB\)\)/.test(js.replace(/\s+/g, ' ').replace(/setPipeline\(g\.pipelines\./g, ''));
+  if (noPointDispatch) good('Dispatch solveCollisions = disp(nB), nicht disp(nP)');
+  else bad('solveCollisions wird nicht mit disp(g.nB) dispatched');
+
+  if (/gid\.x;\s*if \(k >= P\.nCollPts\)/.test(clean.replace(/fn solveCollisions[^]*?$/, '')) === false &&
+      !/fn solveCollisions[\s\S]*?P\.nCollPts/.test(clean)) good('kein Thread-Index mehr über P.nCollPts in solveCollisions');
+  else bad('solveCollisions indexiert weiterhin über P.nCollPts (ein Thread pro Punkt)');
+
+  const hasRange = wg.includes('@binding(8)') && wg.includes('collRange') && js.includes('collRange:');
+  if (hasRange) good('collRange (Binding 8) in Shader und gpuworld.js vorhanden');
+  else bad('collRange fehlt (Shader oder gpuworld.js)');
+
+  // Die Gruppierung ist eine reine exportierte Funktion (groupCollPoints),
+  // damit der Harness sie headless gegen _solveCollisions prüfen kann —
+  // gpuworld.js selbst ist ohne GPUBufferUsage nicht importierbar.
+  const grouped = /export function groupCollPoints/.test(js)
+    && js.includes('groupCollPoints(cpu.collPts, cpu.n)')
+    && js.includes('buffers.collRange');
+  if (grouped) good('Kollisionspunkte werden per groupCollPoints() nach Körper gruppiert (stabil, CPU-Ordnung)');
+  else bad('Kollisionspunkte werden nicht nach Körper gruppiert — Shader-Loop wäre lückenhaft');
+
+  const loopOk = /var cnt = collRange\[nB \+ i\];[\s\S]*?let cp = collPts\[o\];[\s\S]*?bodies\[i\] = b;/.test(clean);
+  // `var`, nicht `let`: cnt wird pro Punkt dekrementiert. `let cnt` ist ein
+  // Compile-Fehler (invalid left-hand side) — von tools/compile-wgsl.js gefangen.
+  if (loopOk) good('Punkte des Körpers werden sequentiell abgearbeitet, EIN Rückschrieb am Ende');
+  else bad('Kollisions-Schleife im Shader nicht in der erwarteten Form');
+}
+
 console.log('\n── Workgroup-Größe ──');
 {
   const ws = [...new Set([...clean.matchAll(/@workgroup_size\((\d+)\)/g)].map(m => +m[1]))];
@@ -212,7 +255,10 @@ console.log('\n── CPU-Oracle-Parität: dieselben Konstanten ──');
   }
   const deadzoneUses = [
     ['xpbd.js', cpu, ['SLACK_POS * SLACK_POS', 'Math.abs(C) >= SLACK_ANG', 'Math.abs(over) >= SLACK_ANG', 'pen <= SLACK_POS']],
-    ['solver.wgsl', wg, ['SLACK_POS * SLACK_POS', 'abs(C) >= SLACK_ANG', 'abs(over) >= SLACK_ANG', 'pen <= SLACK_POS']],
+    // Im Shader steht die Totzone als positiver Guard (`if (pen > SLACK_POS)`),
+    // weil die Kollision dort in einer Körper-Schleife statt per early-return
+    // läuft — dieselbe Semantik, andere Schreibweise.
+    ['solver.wgsl', wg, ['SLACK_POS * SLACK_POS', 'abs(C) >= SLACK_ANG', 'abs(over) >= SLACK_ANG', 'pen > SLACK_POS']],
   ];
   for (const [label, src, needles] of deadzoneUses) {
     const miss = needles.filter(nd => !src.includes(nd));

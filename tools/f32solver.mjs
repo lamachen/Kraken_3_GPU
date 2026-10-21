@@ -60,7 +60,18 @@ function lengthF(x, y) {
  * zurück; roundState() einmal nach jedem Respawn/Upload aufrufen (das
  * entspricht upload() → f32-Puffer).
  */
-export function f32ify(w, map) {
+export function f32ify(w, map, opts = {}) {
+  // collMode: 'seq'   = CPU-Semantik (Punkte nacheinander, kumulativ) — Referenz
+  //           'race'  = GPU-Semantik VOR dem Fix: solveCollisions läuft parallel
+  //                     über ALLE Kollisionspunkte, mehrere Punkte teilen sich
+  //                     aber denselben Körper (Mantel 8, Armsegment 2). Jeder
+  //                     Thread liest bodies[], korrigiert, schreibt zurück —
+  //                     letzter Schreiber gewinnt, die übrigen Korrekturen
+  //                     gehen verloren. Emuliert als: nur die Korrektur des
+  //                     letzten Punkts des Körpers, aus dem URSPRUNGS-Zustand.
+  //           'raceLo'= dasselbe, erster Thread gewinnt
+  //           'jacobi'= alle Korrekturen aus dem Ursprungs-Zustand, aber SUMMIERT
+  const collMode = opts.collMode || 'seq';
   const n = w.n;
   const nC = w.constraints.length;
 
@@ -299,20 +310,65 @@ export function f32ify(w, map) {
   }
 
   // ── Kernel: solveCollisions ───────────────────────────────────────
+  // Punkte-pro-Körper-Index (die GPU dispatched pro PUNKT, nicht pro Körper)
+  const bodyPts = new Array(n).fill(null).map(() => []);
+  for (let i = 0; i < nP; i++) bodyPts[cpBody[i]].push(i);
+
+  function pointDelta(b, i, ox, oy) {
+    const ca = f(Math.cos(w.angP[b])), sa = f(Math.sin(w.angP[b]));
+    const wx = f(ox + f(f(cpLx[i] * ca) - f(cpLy[i] * sa)));
+    const wy = f(oy + f(f(cpLx[i] * sa) + f(cpLy[i] * ca)));
+    const hit = sdfF(wx, wy);
+    if (!hit) return null;
+    const pen = f(cpR[i] - hit.d);
+    if (pen <= SLACK_POS) return null;
+    return [f(hit.nx * pen), f(hit.ny * pen)];
+  }
+
   function solveCollisionsF() {
-    for (let i = 0; i < nP; i++) {
-      const b = cpBody[i];
+    if (collMode === 'seq' || collMode === 'collRev') {
+      // collRev: Reihenfolge der Punkte PRO KÖRPER gedreht — misst, wie stark
+      // die CPU überhaupt auf die Kollisions-Reihenfolge reagiert (die GPU-Race
+      // ist genau diese Empfindlichkeit, nur ohne definierten Gewinner).
+      const order = [];
+      for (let b = 0; b < n; b++) order.push(...(collMode === 'collRev' ? bodyPts[b].slice().reverse() : bodyPts[b]));
+      for (const i of order) {
+        const b = cpBody[i];
+        if (imF[b] === 0) continue;
+        const d = pointDelta(b, i, w.ppx[b], w.ppy[b]);
+        if (!d) continue;
+        w.ppx[b] = f(w.ppx[b] + d[0]);
+        w.ppy[b] = f(w.ppy[b] + d[1]);
+        w.stats.collisions++;
+      }
+      return;
+    }
+    if (false) {
+      for (let i = 0; i < nP; i++) {
+        const b = cpBody[i];
+        if (imF[b] === 0) continue;
+        const d = pointDelta(b, i, w.ppx[b], w.ppy[b]);
+        if (!d) continue;
+        w.ppx[b] = f(w.ppx[b] + d[0]);
+        w.ppy[b] = f(w.ppy[b] + d[1]);
+        w.stats.collisions++;
+      }
+      return;
+    }
+    for (let b = 0; b < n; b++) {
       if (imF[b] === 0) continue;
-      const ca = f(Math.cos(w.angP[b])), sa = f(Math.sin(w.angP[b]));
-      const wx = f(w.ppx[b] + f(f(cpLx[i] * ca) - f(cpLy[i] * sa)));
-      const wy = f(w.ppy[b] + f(f(cpLx[i] * sa) + f(cpLy[i] * ca)));
-      const hit = sdfF(wx, wy);
-      if (!hit) continue;
-      const pen = f(cpR[i] - hit.d);
-      if (pen <= SLACK_POS) continue;
-      w.ppx[b] = f(w.ppx[b] + f(hit.nx * pen));
-      w.ppy[b] = f(w.ppy[b] + f(hit.ny * pen));
-      w.stats.collisions++;
+      const pts = bodyPts[b];
+      const ox = w.ppx[b], oy = w.ppy[b];       // Ursprungs-Zustand: alle Threads
+      let dx = 0, dy = 0, hits = 0;             // lesen dasselbe bodies[]
+      for (let q = 0; q < pts.length; q++) {
+        const d = pointDelta(b, pts[q], ox, oy);
+        if (!d) continue;
+        hits++;
+        if (collMode === 'jacobi') { dx = f(dx + d[0]); dy = f(dy + d[1]); }
+        else if (collMode === 'race') { dx = d[0]; dy = d[1]; }        // letzter gewinnt
+        else if (collMode === 'raceLo' && hits === 1) { dx = d[0]; dy = d[1]; }
+      }
+      if (hits) { w.ppx[b] = f(ox + dx); w.ppy[b] = f(oy + dy); w.stats.collisions += hits; }
     }
   }
 
@@ -377,5 +433,5 @@ export function f32ify(w, map) {
     w._postGripBreak();
   };
 
-  return { roundState, snapshotControls };
+  return { roundState, snapshotControls, collMode };
 }

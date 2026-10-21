@@ -76,6 +76,13 @@ export async function create(cpu, map, wgslSource, device) {
     rects: buf(nR * 4 * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
     forces: buf(nB * 4 * 4, SS),
     colorInfo: buf(33 * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
+    // Kollisionspunkte pro Körper: [0..nB-1] Offset, [nB..2nB-1] Anzahl.
+    // solveCollisions dispatched PRO KÖRPER (ein Race-freier Thread pro Körper,
+    // seine Punkte sequentiell wie _solveCollisions auf der CPU).
+    // 2·nB u32 (Offset + Anzahl pro Körper). 16-Byte-ausgerichtet: ein
+    // ungerades nB würde sonst den letzten Lese-Index des Shaders
+    // (Byte-Offset 4·nB + 4) aus dem Binding-Bereich fallen lassen.
+    collRange: buf(Math.ceil(2 * nB / 4) * 16, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
     readBodies: buf(nB * BODY_STRIDE * 4, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ),
     readCons: buf(nC * CONS_STRIDE * 4, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ),
   };
@@ -100,6 +107,7 @@ export async function create(cpu, map, wgslSource, device) {
       { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     ],
   });
   const pipelineLayout = device.createBindGroupLayout ? device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }) : null;
@@ -132,6 +140,7 @@ export async function create(cpu, map, wgslSource, device) {
         { binding: 5, resource: { buffer: buffers.forces } },
         { binding: 6, resource: { buffer: buffers.colorInfo } },
         { binding: 7, resource: { buffer: ub } },
+        { binding: 8, resource: { buffer: buffers.collRange } },
       ],
     }));
   }
@@ -159,6 +168,42 @@ export async function create(cpu, map, wgslSource, device) {
   g.paramsU = new Uint32Array(g.paramsF.buffer);
   writeStatic(g);
   return g;
+}
+
+/**
+ * Kollisionspunkte nach Körper gruppieren — die Datengrundlage dafür, dass
+ * solveCollisions PRO KÖRPER dispatched werden kann (Race-Fix, s. solver.wgsl).
+ *
+ * STABIL: innerhalb eines Körpers bleibt die Reihenfolge aus `collPts`, denn
+ * der Shader läuft die Punkte eines Körpers sequentiell ab und muss dieselbe
+ * Korrekturfolge sehen wie `_solveCollisions()` auf der CPU (der zweite
+ * Mantelpunkt sieht die Korrektur des ersten).
+ *
+ * Rein und ohne Device — deshalb headless prüfbar (Harness-Check
+ * `coll-grouping`), obwohl der Rest dieser Datei `GPUBufferUsage` braucht.
+ *
+ * @returns {{ order: Uint32Array, range: Uint32Array }}
+ *   order[k] = Index in collPts des k-ten Punktes im GPU-Layout
+ *   range    = [off(0)…off(n-1), cnt(0)…cnt(n-1)]  (2n u32, Binding 8)
+ */
+export function groupCollPoints(collPts, n) {
+  const cnt = new Uint32Array(n);
+  for (let i = 0; i < collPts.length; i++) {
+    const b = collPts[i].body;
+    if (!(b >= 0) || b >= n) throw new Error(`collPt ${i} verweist auf Körper ${b} von ${n}`);
+    cnt[b]++;
+  }
+  const off = new Uint32Array(n);
+  let acc = 0;
+  for (let b = 0; b < n; b++) { off[b] = acc; acc += cnt[b]; }
+  if (acc !== collPts.length) throw new Error(`collRange deckt ${acc} von ${collPts.length} Punkten ab`);
+  const order = new Uint32Array(collPts.length);
+  const cursor = off.slice();
+  for (let i = 0; i < collPts.length; i++) order[cursor[collPts[i].body]++] = i;
+  const range = new Uint32Array(2 * n);
+  range.set(off, 0);
+  range.set(cnt, n);
+  return { order, range };
 }
 
 function writeStatic(g) {
@@ -190,12 +235,13 @@ function writeStatic(g) {
   }
   g.device.queue.writeBuffer(g.buffers.rects, 0, g.rectData);
 
+  const { order, range } = groupCollPoints(cpu.collPts, cpu.n);
+  g.device.queue.writeBuffer(g.buffers.collRange, 0, range);
   const collU = new Uint32Array(g.collData.buffer);
-  for (let i = 0; i < cpu.collPts.length; i++) {
-    const p = cpu.collPts[i], o = i * 4;
+  for (let o4 = 0; o4 < order.length; o4++) {
+    const p = cpu.collPts[order[o4]], o = o4 * 4;
     collU[o] = p.body;                              // u32 im Shader
     g.collData[o + 1] = p.lx; g.collData[o + 2] = p.ly; g.collData[o + 3] = p.r;
-    if (p.body >= cpu.n) throw new Error(`collPt ${i} verweist auf Body ${p.body} von ${cpu.n}`);
   }
   g.device.queue.writeBuffer(g.buffers.collPts, 0, g.collData);
 }
@@ -315,7 +361,7 @@ export function substep(g) {
       p.dispatchWorkgroups(Math.ceil(cnt / WORKGROUP));
     }
     p.setPipeline(g.pipelines.solveCollisions); p.setBindGroup(0, g.bindGroup);
-    p.dispatchWorkgroups(disp(g.nP));
+    p.dispatchWorkgroups(disp(g.nB));   // PRO KÖRPER, nicht pro Punkt (Race-Fix)
     p.end();
   }
   p = pass();

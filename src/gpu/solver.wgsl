@@ -72,6 +72,11 @@ struct Rect  { x: f32, y: f32, w: f32, h: f32 };
 // Schritt: keine writeBuffer-Aufrufe, keine Synchronisation.
 struct ColorU { c: u32, pad0: u32, pad1: u32, pad2: u32 };
 @group(0) @binding(7) var<uniform> UC: ColorU;
+// [0..nBodies-1]   Start-Offset der Kollisionspunkte dieses Körpers
+// [nBodies..2nB-1] Anzahl Kollisionspunkte dieses Körpers
+// Braucht es, weil solveCollisions PRO KÖRPER dispatched, nicht pro Punkt —
+// siehe den Race-Kommentar dort.
+@group(0) @binding(8) var<storage, read> collRange: array<u32>;
 
 const TAU: f32 = 6.28318530718;
 
@@ -344,26 +349,56 @@ fn solveAngle(k: u32) {
   bodies[A] = a;
 }
 
-// ══ 2b. Kollision gegen das SDF ═══════════════════════════════════
+// ══ 2b. Kollision gegen das SDF — EIN Thread pro KÖRPER ═══════════
+// Vorgänger-Stand: EIN DISPATCH PRO KOLLISIONSPUNKT. Das war ein Schreib-Race
+// und ist die gemessene Ursache der G7-Divergenz:
+//   Mantel 8 Punkte, Armsegment 2 Punkte — mehrere Threads lasen dasselbe
+//   bodies[i], korrigierten und schrieben zurück. Letzter Schreiber gewinnt,
+//   die übrigen Korrekturen gehen verloren. Die CPU (_solveCollisions) löst
+//   dieselben Punkte sequentiell und KUMULATIV.
+// Headlos reproduziert (tools/class-spread.mjs, pop 32, seed 7, 150 Schritte):
+//   Variante                        maxΔ      Grip-Flags  pathLen   Fitness
+//   f32, CPU-Kollisionsordnung       0.36 px   100.00 %    +0.01 %   -0.00 %
+//   f32 + Race (letzter gewinnt)    29.77 px    99.44 %   -14.71 %   -3.27 %
+//   f32 + Race (erster gewinnt)     51.10 px    99.35 %   -21.83 %   -3.94 %
+//   f32 + Jacobi (Deltas summiert)  30.54 px    99.27 %   -15.34 %   -3.69 %
+//   ECHTE GPU (RTX 3070 Ti, G7)     22.02 px    99.35 %   -14.80 %      —
+// Die Race-Variante trifft die Hardware-Messung (pathLen -14.71 vs -14.8 %,
+// Flags 99.44 vs 99.35 %); f32 ohne Race bleibt 40× darunter. Also war die
+// G7-Abweichung KEIN chaotisches Klassen-Rauschen, sondern ein definierter
+// Daten-Race — und der Bias (zu kurze Pfade, WEIL weniger Korrekturen -> mehr
+// Penetration -> mehr Slip/Brüche) erklärt auch das Vorzeichen.
+// Fix: pro Körper ein Thread, seine Punkte in CPU-Ordnung sequentiell.
+// Nebenbei billiger: 86 Threads statt 184, kein verlorenes Schreiben.
 @compute @workgroup_size(64)
 fn solveCollisions(@builtin(global_invocation_id) gid: vec3u) {
-  let k = gid.x;
-  if (k >= P.nCollPts) { return; }
-  let cp = collPts[k];
-  var b = bodies[cp.body];
+  let i = gid.x;
+  if (i >= P.nBodies) { return; }
+  var b = bodies[i];
   if (b.invMass == 0.0) { return; }
-  let ca = cos(b.angP); let sa = sin(b.angP);
-  let wx = b.ppx + cp.lx * ca - cp.ly * sa;
-  let wy = b.ppy + cp.lx * sa + cp.ly * ca;
-  let hit = sdf(wx, wy);
-  if (!hit.valid) { return; }
-  let pen = cp.r - hit.d;
-  // Totzone — Parität zu _solveCollisions in xpbd.js: Kontakt-Rauschen unter
-  // dem f32-Boden überspringen, sonst zittert ein aufliegender Körper.
-  if (pen <= SLACK_POS) { return; }
-  b.ppx = b.ppx + hit.nx * pen;
-  b.ppy = b.ppy + hit.ny * pen;
-  bodies[cp.body] = b;
+  let nB = P.nBodies;
+  var cnt = collRange[nB + i];     // var, nicht let: wird pro Punkt dekrementiert
+  var o = collRange[i];
+  loop {
+    if (cnt == 0u) { break; }
+    let cp = collPts[o];
+    let ca = cos(b.angP); let sa = sin(b.angP);
+    let wx = b.ppx + cp.lx * ca - cp.ly * sa;
+    let wy = b.ppy + cp.lx * sa + cp.ly * ca;
+    let hit = sdf(wx, wy);
+    if (hit.valid) {
+      let pen = cp.r - hit.d;
+      // Totzone — Parität zu _solveCollisions in xpbd.js: Kontakt-Rauschen
+      // unter dem f32-Boden überspringen, sonst zittert ein aufliegender Körper.
+      if (pen > SLACK_POS) {
+        b.ppx = b.ppx + hit.nx * pen;
+        b.ppy = b.ppy + hit.ny * pen;
+      }
+    }
+    o = o + 1u;
+    cnt = cnt - 1u;
+  }
+  bodies[i] = b;
 }
 
 // ══ 3. Abschluss: Geschwindigkeiten aus der Positionsänderung ══════

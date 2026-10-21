@@ -789,21 +789,38 @@ if (want('gputrain')) {
 }
 
 // ══════════════════════════════════════════════════════════════
-section('CHECK G7 — SOLVER-CHAOS-KLASSEN (Neukalibrierung der G7-Tore, M3c)');
+section('CHECK G7 — SOLVER-DIVERGENZ: RACE GEFUNDEN, KLASSE NEU GEMESSEN');
 if (want('chaos')) {
-  // G7-Hardwaremessung (RTX 3070 Ti, fb622c8): maxΔ 32.69 px, 4.07 % Flag-Flips,
-  // pathLen -3.99 % — die alten Tore (< 0.5 px / ≥ 99 %) FAILten. Nachmessung
-  // (tools/lyap-, inject-, breaktiming-, order-, f32parity-probe + f32solver):
-  // Die Dynamik ist KONTRAKTIV gegen Zustandsstörungen, aber CHAOTISCH gegen
-  // Solver-Internika (Ordnung, f32-Arithmetik):
-  //   Zustandsrauschen 1e-3 px/Schritt   → maxΔ 0.0042 px  (absorbiert)
-  //   Bruchkraft-Rauschen 1e-2 relativ   → maxΔ 0.1477 px  (absorbiert)
-  //   Solve-Ordnung gedreht (reines f64!)→ maxΔ 35.35 px, pathLen +25.3 %
-  //   f32-Emulation per-op, gleiche Ordnung → 0.78 px (seed 7), 19.3 px (seed 13)
-  // Die Checks unten pinnen beide Seiten der Fehlerklasse, damit die
-  // In-Browser-Selbstkalibrierung von G7 (Kontrolle = Ordnung gedreht)
-  // eine gültige Referenz bleibt. gpu.html G7-Tor: maxΔ_GPU ≤ 3× maxΔ_Kontrolle.
-  const { createTrainer } = await import('../src/sim/train.js');
+  // G7 hat zwei Hardware-Runden gebraucht, und die erste Deutung war FALSCH.
+  // Chronik:
+  //   fb622c8  maxΔ 32.69 px, pathLen -3.99 %  → Tore < 0.5 px FAIL
+  //   529fdc7  Tore auf "Solver-Klassen" gelockert, Kontrolle = Ordnung gedreht
+  //            → maxΔ 22.02 px OK, aber pathLen -14.8 % gegen Kontrolle -7.9 % FAIL
+  // Der Fehler in 529fdc7 war die PRÄMISSE: Die f32-Emulation lief mit der
+  // Kollisions-Ordnung der CPU und blieb bei 0.36 px. Also war Numerik nicht
+  // die Ursache — und "chaotische Klasse" war nur der Platzhalter dafür, dass
+  // die Emulation einen Teil des GPU-Solvers nicht nachgebildet hat.
+  // tools/class-spread.mjs hat die fehlende Variable isoliert: solveCollisions
+  // dispatchte EINEN THREAD PRO KOLLISIONSPUNKT, aber Mantel (8 Punkte) und
+  // Armsegmente (2 Punkte) teilen sich einen Körper → Schreib-Race auf
+  // bodies[], letzter Schreiber gewinnt; die CPU korrigiert kumulativ.
+  // Messung pop 32, seed 7, 150 Schritte:
+  //   Variante                        maxΔ      Flags     pathLen    Fitness
+  //   f32, CPU-Kollisionsordnung       0.36 px  100.00 %   +0.01 %    -0.00 %
+  //   f32 + Race (letzter gewinnt)    29.77 px   99.44 %  -14.71 %    -3.27 %
+  //   f32 + Race (erster gewinnt)     51.10 px   99.35 %  -21.83 %    -3.94 %
+  //   f32 + Jacobi (Deltas summiert)  30.54 px   99.27 %  -15.34 %    -3.69 %
+  //   ECHTE RTX 3070 Ti (G7)          22.02 px   99.35 %  -14.80 %       —
+  // Race trifft die Hardware-Messung, race-frei bleibt 40× darunter — und der
+  // Bias stimmt im Vorzeichen (weniger Korrektur → mehr Penetration → mehr
+  // Slip/Brüche → kürzerer Pfad). Der Fix: EIN Thread pro Körper, seine Punkte
+  // sequentiell (solver.wgsl + collRange-Binding 8, statisch gepinnt von
+  // tools/check-wgsl.js, Abschnitt "Kollisions-Race").
+  // Was von der Klassen-Erklärung ÜBRIG bleibt, messen die Checks unten:
+  // Zustandsrauschen wird absorbiert, die Farb-Ordnung ist frei, und reine
+  // f32-Arithmetik kostet < 1 px. Nur die Listenordnung der CPU (Gauss-Seidel
+  // über alle Farben gemischt) ist chaotisch — die GPU hat sie nie benutzt.
+const { createTrainer } = await import('../src/sim/train.js');
   const { gpuTrainStep, beginGenerationGpu } = await import('../src/sim/gputrain.js');
   const OPTS = { popSize: 8, stepsPerGen: 150, seed: 7, prey: 2 };
 
@@ -850,23 +867,142 @@ if (want('chaos')) {
   // b) Solve-Ordnung gedreht (reines f64!) divergiert chaotisch — die Klasse existiert
   {
     const r = await lockstep((tr) => { tr.sim.world.constraints.reverse(); });
-    check('order-chaos', 'Solve-Ordnung gedreht (f64) divergiert chaotisch — Klasse existiert',
+    check('order-chaos', 'CPU-Listenordnung gedreht (f64) divergiert — ordnungs-chaotisch',
       r.maxD > 1,
       `maxΔ ${r.maxD.toFixed(2)} px, Flips ${r.mism}/7200, pathLen ${r.plA.toFixed(2)}→${r.plB.toFixed(2)} ` +
-      `(Referenz: 35.35 px, 236 Flips, +25.3 %) — Schritt-Parität ist zwischen gültigen Solvern unerreichbar`);
+      `(Referenz: 35.35 px, 236 Flips, +25.3 %). Betrifft die CPU: die löst Gauss-Seidel in ` +
+      `Listenordnung über ALLE Farben gemischt. Die GPU dispatched farbweise aufsteigend — ` +
+      `dieselbe Ordnung wie die CPU nach groupConstraintsByColor, also kein Unterschied.`);
   }
 
   // c) f32-Solver-Emulation (gleiche Ordnung, per-op fround) bleibt in der Klasse
   {
     const { f32ify } = await import('./f32solver.mjs');
+    const pct = (r) => 100 * (r.plB - r.plA) / Math.max(1e-9, r.plA);
     const r = await lockstep((tr) => {
-      const emu = f32ify(tr.sim.world, tr.sim.map);
+      const emu = f32ify(tr.sim.world, tr.sim.map, { collMode: 'seq' });
       emu.roundState();   // = upload(): Anfangszustand als f32
     });
-    check('f32-class', 'f32-Emulation (per-op, gleiche Ordnung): NaN 0, maxΔ < 40 px, pathLen ±6 %',
-      r.nan === 0 && r.maxD < 40 && Math.abs(r.plB - r.plA) < 0.06 * Math.max(r.plA, 1e-9),
-      `maxΔ ${r.maxD.toFixed(3)} px, pathLen ${r.plA.toFixed(2)}→${r.plB.toFixed(2)}, NaN ${r.nan} ` +
-      `(Referenz seed 7: 0.78 px/+0.24 %; GPU-Messung 32.7 px liegt in Klasse [0.8, 35.4])`);
+    check('f32-class', 'f32-Emulation (per-op, race-freie Kollision): NaN 0, maxΔ < 5 px, pathLen ±2 %',
+      r.nan === 0 && r.maxD < 5 && Math.abs(pct(r)) < 2,
+      `maxΔ ${r.maxD.toFixed(3)} px, pathLen ${r.plA.toFixed(2)}→${r.plB.toFixed(2)} (${pct(r).toFixed(2)} %), NaN ${r.nan} ` +
+      `(Referenz seed 7/pop 8: 0.78 px/+0.24 %; pop 32: 0.36 px/+0.01 %) — DAS ist die Erwartung für die GPU nach dem Race-Fix`);
+
+    // d) Der Race selbst — reproduzierbare Ursache statt Vermutung. 'race'
+    //    emuliert den Stand 529fdc7 (ein Thread pro Kollisionspunkt, letzter
+    //    Schreiber gewinnt). Muss deutlich über der race-freien Zahl liegen,
+    //    sonst war die Diagnose Zufall.
+    const rRace = await lockstep((tr) => {
+      const emu = f32ify(tr.sim.world, tr.sim.map, { collMode: 'race' });
+      emu.roundState();
+    });
+    check('coll-race-repro', 'Kollisions-Race (Stand 529fdc7) reproduziert die GPU-Divergenz',
+      rRace.nan === 0 && rRace.maxD > 10 * Math.max(r.maxD, 1e-9),
+      `race maxΔ ${rRace.maxD.toFixed(2)} px / pathLen ${pct(rRace).toFixed(2)} %  vs  race-frei ${r.maxD.toFixed(3)} px / ${pct(r).toFixed(2)} % ` +
+      `(Hardware RTX 3070 Ti pop 32: 22.02 px / -14.80 %; Emulation pop 32: 29.77 px / -14.71 %)`);
+  }
+
+  // e) Innerhalb einer Farbklasse ist die Solve-Ordnung BELIEBIG — genau die
+  //    Freiheit, die der parallele GPU-Dispatch pro Farbe hat. Bleibt die
+  //    Abweichung bei 0, ist die Farbordnung als Ursache ausgeschlossen und
+  //    der Race-Fix reicht als Erklärung.
+  {
+    const r = await lockstep((tr) => {
+      const w = tr.sim.world;
+      let s0 = 12345;
+      const rnd = () => { s0 = (Math.imul(s0, 1103515245) + 12345) & 0x7fffffff; return s0 / 0x7fffffff; };
+      for (let c = 0; c < w.colorOff.length; c++) {
+        const o = w.colorOff[c], n = w.colorCnt[c];
+        for (let i = n - 1; i > 0; i--) {
+          const j = (rnd() * (i + 1)) | 0;
+          const t = w.constraints[o + i]; w.constraints[o + i] = w.constraints[o + j]; w.constraints[o + j] = t;
+        }
+      }
+    });
+    check('color-order-free', 'Ordnung INNERHALB einer Farbklasse ist frei (GPU-Dispatch-Parität)',
+      r.maxD < 1e-9 && r.mism === 0,
+      `maxΔ ${r.maxD.toExponential(2)} px, Flips ${r.mism}/7200 — Farbgruppen sind körper-disjunkt, ` +
+      `der parallele Dispatch pro Farbe ist deshalb exakt, nicht nur näherungsweise`);
+  }
+
+  // f) Der Race-Fix selbst, ÄQUIVALENZ statt Quelltext-Vergleich: Der Shader
+  //    läuft pro Körper die Punkte in der von groupCollPoints() gelieferten
+  //    Reihenfolge ab. Dieser Check geht denselben Weg und muss BIT-identisch
+  //    zum kumulativen _solveCollisions() der CPU kommen. Wäre die Gruppierung
+  //    lückenhaft oder verdreht, sähe man es hier — ohne GPU-Device.
+  {
+    const { groupCollPoints } = await import('../src/gpu/gpuworld.js');
+    const sim = createSim({ seed: 5, creatures: 3, prey: 0 });
+    const w = sim.world, map = sim.map;
+    let maxErr = 0, trials = 0, contacts = 0;
+    // Posen, die WIRKLICH Kontakt haben: Zufallsstreuen bringt 0 Kontakte
+    // (gemessen — der Check war damit wertlos). Stattdessen jede Pose entlang
+    // einer Rechteckkante der Karte, 18 Rechtecke × 6 Lagen, plus 20 Posen aus
+    // einem laufenden Sim-Schritt (echte Gang-Kontakte).
+    const poses = [];
+    for (let ri = 0; ri < map.rects.length; ri++) {
+      const r = map.rects[ri];
+      for (let v = 0; v < 6; v++) {
+        const p = { px: new Float64Array(w.n), py: new Float64Array(w.n), ang: new Float64Array(w.n), tag: `rect${ri}/lage${v}` };
+        for (let i = 0; i < w.n; i++) {
+          const u = ((i + v * 7) % 10) / 10;
+          p.px[i] = r.x + r.w * (v % 2 ? u : 0.5) + (v % 3) - 1;
+          p.py[i] = r.y + r.h * (v % 2 ? 0.5 : u) + ((v >> 1) % 3) - 1;
+          p.ang[i] = (i * 0.7 + v * 1.1) % 6.283;
+        }
+        poses.push(p);
+      }
+    }
+    {
+      const rnd = mulberry32(4242);
+      for (let t = 0; t < 20; t++) {
+        for (const c of sim.creatures) applyControl(c, { tone: 0.2 + 0.6 * rnd(), emitEcho: false, arms: c.arms.map(() => ({ shoulder: rnd() * 2 - 1, curl: rnd() * 2 - 1, adhesion: rnd() })) });
+        stepSim(sim);
+        const p = { px: Float64Array.from(w.px), py: Float64Array.from(w.py), ang: Float64Array.from(w.ang), tag: `sim${t}` };
+        poses.push(p);
+      }
+    }
+    for (const pose of poses) {
+      for (let i = 0; i < w.n; i++) { w.px[i] = pose.px[i]; w.py[i] = pose.py[i]; w.ang[i] = pose.ang[i]; }
+      w.ppx.set(w.px); w.ppy.set(w.py); w.angP.set(w.ang);
+      trials++;
+      const snap = { px: Float64Array.from(w.px), py: Float64Array.from(w.py),
+                     ppx: Float64Array.from(w.ppx), ppy: Float64Array.from(w.ppy),
+                     angP: Float64Array.from(w.angP) };
+      const restore = () => { w.ppx.set(snap.ppx); w.ppy.set(snap.ppy); w.angP.set(snap.angP); };
+
+      restore();
+      w._solveCollisions();                      // CPU-Oracle: Punkte sequentiell, kumulativ
+      const refX = Float64Array.from(w.ppx), refY = Float64Array.from(w.ppy);
+
+      restore();                                 // GPU-Weg: pro Körper, Punkte in order[]
+      const { order, range } = groupCollPoints(w.collPts, w.n);
+      const nB = w.n;
+      for (let b = 0; b < nB; b++) {
+        if (w.im[b] === 0) continue;
+        const cnt = range[nB + b];
+        let px = w.ppx[b], py = w.ppy[b];
+        for (let q = 0; q < cnt; q++) {
+          const cp = w.collPts[order[range[b] + q]];
+          const ca = Math.cos(w.angP[b]), sa = Math.sin(w.angP[b]);
+          const hit = map.sdf(px + cp.lx * ca - cp.ly * sa, py + cp.lx * sa + cp.ly * ca);
+          if (!hit) continue;
+          const pen = cp.r - hit.d;
+          if (pen <= SLACK_POS) continue;
+          px += hit.nx * pen; py += hit.ny * pen; contacts++;
+        }
+        w.ppx[b] = px; w.ppy[b] = py;
+      }
+
+      for (let i = 0; i < w.n; i++) {
+        maxErr = Math.max(maxErr, Math.abs(w.ppx[i] - refX[i]), Math.abs(w.ppy[i] - refY[i]));
+      }
+      void snap;
+    }
+    check('coll-grouping', 'groupCollPoints + Shader-Weg = _solveCollisions, bit-identisch',
+      maxErr === 0 && contacts > 500,
+      `${trials} Posen × ${w.n} Körper, ${contacts} wirksame Kontakte (Gate > 500, sonst prüft der Check nichts), max|Δ| ${maxErr.toExponential(2)} px ` +
+      `(Mantel 8 Punkte, Armsegment 2 — genau die Körper, die den Race ausmachten)`);
   }
 }
 
@@ -899,10 +1035,33 @@ if (want('wgsl')) {
     const out = execFileSync('node', [join(ROOT, 'tools/check-wgsl.js')], { encoding: 'utf8' });
     const fails = (out.match(/❌/g) || []).length;
     check('wgsl-static', 'Shader-Structs, Bindings und Entry-Points konsistent zu gpuworld.js', fails === 0,
-      fails === 0 ? 'Strides, 6 Bindings, 5 Entry-Points, Workgroup 64, Substep-Reihenfolge, Konstanten-Parität' : fails + ' Inkonsistenz(en)');
+      fails === 0 ? 'Strides, 9 Bindings, 6 Entry-Points, Workgroup 64, Substep-Reihenfolge, Konstanten-Parität, Kollisions-Race-Fix' : fails + ' Inkonsistenz(en)');
   } catch (e) {
     check('wgsl-static', 'Shader-Structs, Bindings und Entry-Points konsistent', false, (e.stdout || e.message).split('\n').filter(l => l.includes('❌')).join(' | '));
   }
+  // Echter Compile-Check (naga als WASM): check-wgsl.js vergleicht nur Texte
+  // und kann kein WGSL parsen. Im Race-Fix stand `let cnt = …` und wurde in
+  // der Schleife dekrementiert — `invalid left-hand side of assignment`.
+  // Ohne Compile-Check hätte das genau einen Browser-Start beim Benutzer
+  // gekostet. SKIP (Code 3), wenn naga-wasm nicht installiert ist; die CI
+  // installiert es, lokal ist es optional (npm i --no-save naga-wasm@30.2.0).
+  {
+    const { execFileSync } = await import('node:child_process');
+    let code = 0, out = '';
+    try { out = execFileSync('node', [join(ROOT, 'tools/compile-wgsl.js'), '--json'], { encoding: 'utf8' }); }
+    catch (e) { code = e.status === undefined ? 1 : e.status; out = (e.stdout || '') + (e.stderr || ''); }
+    let info = null;
+    try { info = JSON.parse(out); } catch { /* SKIP-Ausgabe ist kein JSON */ }
+    if (code === 3) {
+      console.log('  ⚪ wgsl-compile  SKIP — naga-wasm nicht installiert (npm i --no-save naga-wasm@30.2.0; die CI hat es)');
+    } else {
+      check('wgsl-compile', 'solver.wgsl compiliert: naga parst, validiert, serialisiert zurück',
+        code === 0 && !!info && info.ok === true,
+        info && info.ok ? `${info.bytes} B → ${info.roundtripBytes} B IR, Entry-Points ${(info.entryPoints || []).join(', ')}`
+                        : (info && info.error ? info.error.split('\n')[0] : out.split('\n')[0]));
+    }
+  }
+
   // Shader-Datei muss vom Pages-Workflow ausgeliefert werden
   const wf = readFileSync(join(ROOT, '.github/workflows/deploy-pages.yml'), 'utf8');
   check('wgsl-deployed', 'gpu.html und solver.wgsl werden deployed',

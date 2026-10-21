@@ -62,10 +62,12 @@ src/gpu/solver.wgsl    WGSL-Port des Solvers (Jacobi, f32, sequentielle Farb-Dis
 src/gpu/gpuworld.js    Buffer/Bind-Groups, upload/packControls, step, download/mirrorInto.
 src/sim/gputrain.js    Hybrid-Trainer: Physik GPU, Sinne/Netz/ES CPU, Zustandsspiegel.
 src/render/            EINZIGE DOM-abhängige Schicht (view.js) + Platzhalter-Gang (demo.js).
-tools/harness.js       56 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
+tools/harness.js       60 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
 tools/profile-step.js  Zerlegt den Tier-Schritt in Phasen (µs) — Architektur-Entscheide.
 tools/mocktrain.js     Hybrid-Trainer headless ohne Device (Passthrough/f32-Mock).
-tools/f32solver.mjs    f32-Solver-Emulation (WGSL-Semantik per-op) — G7-Fehlerklassen.
+tools/f32solver.mjs    f32-Solver-Emulation (WGSL-Semantik per-op, 4 Kollisions-Modi).
+tools/class-spread.mjs Misst die Solver-Divergenz pro Störvariante — fand den Kollisions-Race.
+tools/compile-wgsl.js  Echter WGSL-Compile (naga als WASM) — optional, in der CI Pflicht.
 tools/*-probe.mjs      Messproben: Lyapunov, Injektion, Bruch-Timing, Ordnung, f32-Parität.
 ```
 
@@ -127,7 +129,7 @@ voll gestellt   (900 N Grenze)  → hält unter demselben Zug
 ## Abnahme: `node tools/harness.js`
 
 ```
-56/56 Checks bestanden
+60/60 Checks bestanden
   passiv        exakt in Ruhe            Pfad 0.00e+0 px        (v2: 964 px)
   slack-fixpoint Störung < slack         Δ = 0.00e+0 px, v = 0  (f32-Boden: GPU driftete 1.28 px)
   slack-corrects 25× slack korrigiert    0.050 px → 1.95e-3 px
@@ -136,8 +138,10 @@ voll gestellt   (900 N Grenze)  → hält unter demselben Zug
   prey-determinism Beute aus Seed identisch (fix: makeEntity zog Math.random())
   gputrain-identical Hybrid = CPU-Trainer Fitness bit-identisch, 2 Gen × 8 Tiere × 120 Schritte
   noise-absorbed Zustandsrauschen zerfällt 1e-3 px/Schritt → maxΔ 3.9e-3 px (kontraktiv)
-  order-chaos    Solve-Ordnung gedreht (f64!) maxΔ 35.35 px — Schritt-Parität unerreichbar
-  f32-class      f32-Emulation in der Klasse maxΔ 0.78 px, pathLen +0.24 %, NaN 0
+  order-chaos    CPU-Listenordnung gedreht (f64) maxΔ 35.35 px — die CPU ist ordnungs-chaotisch
+  f32-class      f32-Emulation race-frei: maxΔ 0.78 px, pathLen +0.24 %, NaN 0
+  coll-race-repro Kollisions-Race reproduziert die GPU-Divergenz: 74.5 px vs 0.78 px race-frei
+  color-order-free Ordnung innerhalb einer Farbklasse ist frei: maxΔ 0.00e+0 — GPU-Dispatch exakt
   spawn         Pin-Verletzung 0         max 0.000e+0 px        (v2: 56.94 px)
   spawn-motor   Muskelziele = Spawn-Pose
   grip          verankerter Arm zieht    70.6 px = 72 %         (v2: 92…99 %)
@@ -249,22 +253,44 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
    die Bindings. **`gpu.html` fährt CPU und GPU auf identischen Eingaben im
    selben Browser und vergleicht sie.**
 
-   Bit-Identität ist dabei *kein* gültiges Kriterium und wird nicht behauptet:
-   die CPU löst sequentiell (Gauss-Seidel), die GPU parallel ohne Atomics
-   (Jacobi). Bei mehreren Constraints am selben Körper ist das Ergebnis
-   reihenfolgeabhängig. Validiert wird deshalb getrennt:
+   **Bit-Identität ist kein Kriterium — aber fast.** Der Grund steht seit der
+   Race-Messung fest und war vorher nur vermutet: Beide Solver lösen dieselben
+   Constraints in derselben Reihenfolge. `core.js` färbt und sortiert beim
+   Spawn (`groupConstraintsByColor`), die CPU iteriert die farblich sortierte
+   Liste, die GPU dispatched die Farben aufsteigend — identisch. Und
+   *innerhalb* einer Farbklasse ist die Reihenfolge **messbar beliebig**
+   (Harness-Check `color-order-free`: maxΔ 0.00e+0 px, 0 Grip-Flips), weil
+   Farbgruppen körper-disjunkt sind. Der parallele Dispatch pro Farbe ist also
+   exakt, nicht nur näherungsweise; übrig bleibt f32 gegen f64.
+
+   Gemessene Restabweichung (race-frei, `tools/class-spread.mjs`, 150 Schritte):
+   **0.36 px bei pop 32**, 0.78 px bei pop 8/seed 7, 19.3 px bei pop 8/seed 13
+   — nicht Null, aber zwei Größenordnungen unter dem, was der Race produzierte.
+   Validiert wird deshalb getrennt:
 
    - **EXAKT** — passives Gleichgewicht (Soll: 0.0), Spawn-Verletzung (Soll: 0),
      NaN-Freiheit, GPU-Determinismus, Grip-Bruch-Status
-   - **TOLERANZ ±30 %** — grip-pull-Weg, Spitzenwerte innerhalb der Limits
+   - **TOLERANZ** — grip-pull-Weg ±30 %, Spitzenwerte innerhalb der Limits,
+     und in G7 maxΔ < 5 px / Grip-Flags ≥ 99.5 % / Brüche ±10 % / pathLen ±5 %
+     / Fitness ±5 % (alle aus der race-freien f32-Emulation abgeleitet, nicht
+     aus einer „Klasse")
 
-   Statisch ohne GPU prüfbar (`tools/check-wgsl.js`, Check 12 im Harness):
-   Struct-Feldanzahl gegen Byte-Stride, Params-Größe gegen Buffer, alle 5
-   Entry-Points verdrahtet, 6 Bindings mit korrektem `read-only-storage` vs.
-   `storage`, Workgroup-Größe identisch, Substep-Reihenfolge wie im Oracle, und
-   alle Solver-Konstanten werden aus dem CPU-World *gelesen* statt dupliziert
-   — einschließlich der Totzone (`SLACK_POS`/`SLACK_ANG`, Werte UND Verwendung
-   auf beiden Seiten).
+   Statisch ohne GPU prüfbar — zwei Werkzeuge, weil sie Verschiedenes können:
+
+   - `tools/check-wgsl.js` (Textvergleich): Struct-Feldanzahl gegen Byte-Stride,
+     Params-Größe gegen Buffer, alle 6 Entry-Points verdrahtet, 9 Bindings mit
+     korrektem `read-only-storage` vs. `storage`, Workgroup-Größe identisch,
+     Substep-Reihenfolge wie im Oracle, Solver-Konstanten aus dem CPU-World
+     *gelesen* statt dupliziert (einschließlich `SLACK_POS`/`SLACK_ANG`, Werte
+     UND Verwendung auf beiden Seiten), und die sechs Race-Invarianten des
+     Kollisions-Dispatches (pro Körper statt pro Punkt, `collRange` vorhanden,
+     Dispatch `disp(nB)`, Gruppierung über `groupCollPoints()`, ein Rückschrieb
+     am Schleifenende).
+   - `tools/compile-wgsl.js` (**echter Compile**, naga 30 als WASM): parst,
+     validiert und serialisiert den Shader zurück. Kostet einen Browser-Start
+     pro vermiedenem Tippfehler — im Race-Fix war es `let cnt` statt `var cnt`
+     in einer Schleife, was kein Textvergleich der Welt findet. Optional lokal
+     (`npm i --no-save naga-wasm@30.2.0`), Pflicht in der CI.
 
    **Messstand Browser-Validierung** (RTX 3070 Ti, Build `1d82d4e`): **11/11**.
    G1 passiv 6.4e-5 px (< 0.05), Wachstum **0.0000** px, maxV **0.0000** px/s;
@@ -273,7 +299,20 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
    (vor der Control-Pfad-Korrektur: 0.1415 = Rauschboden, falsch-positiv);
    G5 deterministisch, identische Hashes 429477292 unter Last;
    G6 Durchsatz 0.3× (N=1) / 18.6× (N=64) / **90.8× (N=512) = 455 111
-   Kraken-Schritte/s**. Zwei Befunde aus der 10/11-Runde (`d487532`), beide
+   Kraken-Schritte/s**.
+
+   **Offener Hardware-Messstand: G7 nach dem Kollisions-Race-Fix.** G1–G6 und
+   G8 sind auf der RTX 3070 Ti grün (letzte Messung Build `529fdc7`: G8 6.8×,
+   512 Episoden in 12.4 s). G7 lieferte dort maxΔ 22.02 px / Flags 99.35 % /
+   pathLen -14.80 % — mit dem Race im Shader. Erwartet werden nach dem Fix die
+   Zahlen der race-freien Emulation: maxΔ ≈ 0.4 px, Flags ≈ 100 %, pathLen
+   ≈ 0 %, Fitness ≈ 0 %. Solange diese Messung aussteht, ist der Fix headlos
+   bewiesen (Äquivalenz-Check `coll-grouping`: 128 Posen, 26 356 Kontakte,
+   max|Δ| = 0.00e+0 px gegen `_solveCollisions`) und statisch abgesichert
+   (`check-wgsl.js` Kollisions-Race-Abschnitt, `compile-wgsl.js` naga-Compile),
+   aber nicht auf echtem Silizium.
+
+   Zwei Befunde aus der 10/11-Runde (`d487532`), beide
    behoben und als Regression gepinnt:
 
    - **G1 Wachstum 1.2789 px** — kein Race, sondern die numerische Bodenhöhe
@@ -294,7 +333,7 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
      ≥ 80 % des CPU-Spitzenwerts — „nur unter Limit" besteht sonst auch
      im Stillstand. G5 lädt die Steuerung seitdem ebenfalls hoch
      (Determinismus unter Muskellast, nicht nur im Ruhezustand).
-4. **[fertig: 3c — auf Hardware validiert, G7-Tore neu kalibriert] Hybrid-Trainer — Training auf der GPU.**
+4. **[fertig: 3c — auf Hardware validiert; 3c-fix: Kollisions-Race im Shader behoben, G7-Tore dadurch wieder scharf] Hybrid-Trainer — Training auf der GPU.**
    Profil zuerst (`tools/profile-step.js`, pop=32, µs pro Tier·Schritt):
 
    | Phase | µs | Anteil |
@@ -342,49 +381,78 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
    (3010 Tier-Schritte/s), 512 Episoden in 12.4 s = 24.3 ms/Episode, und
    gelernt wird durch die Mirror-Pipeline: Gen 0 → 1: best 248.5 → 324.1,
    Anker 53 → 77 %, Zyklen 0.65 → 0.93. **G7** (Lockstep-Parität) FAILte
-   dagegen mit den aus dem f32-Mock abgeleiteten Toren: maxΔ 32.69 px statt
-   < 0.5 px, 4.07 % Grip-Flag-Flips statt < 1 % — die Nachmessung zeigte:
-   die Tore kalibrierten die falsche Fehlerklasse.
+   dagegen: maxΔ 32.69 px statt < 0.5 px, 4.07 % Grip-Flag-Flips statt < 1 %.
+   Zwei Deutungsversuche später stand die Ursache fest — ein Schreib-Race im
+   Kollisions-Dispatch, kein Numerik- und kein Chaos-Problem (nächster
+   Abschnitt). G8-Zahlen sind vor dem Fix gemessen und gelten weiterhin: der
+   Race betraf die Kollisionskorrektur, nicht den Durchsatz.
 
-   **Die zwei Fehlerklassen** (kopflos vermessen: `tools/lyap-`, `inject-`,
-   `breaktiming-`, `order-`, `f32parity-probe.mjs` + `f32solver.mjs`; als
-   Regression gepinnt: `node tools/harness.js --only chaos`):
+   **Die vermeintlichen „zwei Fehlerklassen" — und was wirklich dahinter war.**
+   Build `529fdc7` erklärte die G7-Abweichung mit Chaos: die Dynamik sei
+   kontraktiv gegen Zustandsstörungen, aber chaotisch gegen Solver-Internika
+   (f32, Trig-ulp, fma, Solve-Ordnung), deshalb seien 32.69 px „Klasse" und
+   Schritt-Parität unerreichbar. **Diese Erklärung war falsch**, und der
+   Beweis dafür ist eine Zahl: die f32-Emulation (`tools/f32solver.mjs`),
+   Operation für Operation aus `solver.wgsl` abgeschrieben, blieb bei
+   **0.36 px** (pop 32, seed 7). Wäre f32 die Ursache, hätte sie bei ~22 px
+   landen müssen. Die Emulation hatte also etwas nicht nachgebildet.
+
+   `tools/class-spread.mjs` hat die fehlende Variable isoliert — die
+   Kollisions-Semantik. `solveCollisions` dispatchte **einen Thread pro
+   Kollisionspunkt**, aber der Mantel hat 8 Punkte und jedes Armsegment 2
+   (`src/body/kraken.js`): mehrere Threads lasen dasselbe `bodies[i]`,
+   korrigierten und schrieben zurück. Letzter Schreiber gewinnt, die übrigen
+   Korrekturen gehen verloren. `_solveCollisions()` auf der CPU läuft
+   sequentiell und **kumulativ** — der zweite Mantelpunkt sieht die Korrektur
+   des ersten. Messung pop 32, seed 7, 150 Schritte:
+
+   | Variante (headlos, `tools/class-spread.mjs`) | maxΔ | Grip-Flags | pathLen | Fitness |
+   |---|---|---|---|---|
+   | f32, Kollision in CPU-Ordnung | **0.36 px** | 100.00 % | **+0.01 %** | -0.00 % |
+   | f32 + Race, letzter Punkt gewinnt | 29.77 px | 99.44 % | -14.71 % | -3.27 % |
+   | f32 + Race, erster Punkt gewinnt | 51.10 px | 99.35 % | -21.83 % | -3.94 % |
+   | f32 + Jacobi (alle Deltas summiert) | 30.54 px | 99.27 % | -15.34 % | -3.69 % |
+   | **echte RTX 3070 Ti (G7, Build 529fdc7)** | **22.02 px** | **99.35 %** | **-14.80 %** | — |
+
+   Die Race-Zeile trifft die Hardware-Messung (pathLen -14.71 vs -14.80 %,
+   Flags 99.44 vs 99.35 %), race-frei bleibt **40× darunter**, und selbst das
+   Vorzeichen passt mechanisch: weniger Korrektur → mehr Penetration → mehr
+   Slip und Brüche → kürzerer Pfad. Es war also kein Chaos, sondern ein
+   Daten-Race — laut WebGPU-Spezifikation undefiniertes Verhalten bei
+   überlappenden Writes ohne Atomics oder Barriere.
+
+   **Fix:** ein Thread pro Körper, seine Punkte sequentiell in CPU-Ordnung
+   (`solver.wgsl` `solveCollisions`, neue `collRange`-Bindung 8; Punkte werden
+   in `gpuworld.js` stabil nach Körper gruppiert hochgeladen). Nebenbei
+   billiger: 86 Threads statt 184 pro Kollisions-Dispatch.
+
+   Was von der Chaos-Erklärung **übrig bleibt**, ist enger und präziser
+   (Regression: `node tools/harness.js --only chaos`, 5 Checks):
 
    | Störung (150 NN-Schritte, seed 7, pop 8, prey 2) | maxΔ Mantel | pathLen-Δ |
    |---|---|---|
    | Anfangsstörung 1e-7 px (Lyapunov-Probe) | 7e-9 px (zerfällt!) | 0 % |
-   | Zustandsrauschen 1e-3 px/Schritt, alle Körper | 0.0042 px | ~0 % |
+   | Zustandsrauschen 1e-3 px/Schritt, alle Körper | 0.0039 px (3.86e-3) | ~0 % |
    | Bruchkraft-Rauschen 1e-2 relativ | 0.1477 px | +0.1 % |
-   | f32-Emulation per-op, gleiche Ordnung (3 Seeds) | 0.78 … 19.3 px | ≤ +2.1 % |
-   | **Solve-Ordnung gedreht — reines f64!** | **35.35 px** | **+25.3 %** |
-   | echte GPU (RTX 3070 Ti) | 32.69 px | **-4.0 %** |
+   | Ordnung **innerhalb** einer Farbklasse gemischt | **0.00e+0 px** | 0 % |
+   | f32-Emulation per-op, race-frei (seed 7 / 13) | 0.78 px / 19.3 px | +0.24 % / +2.14 % |
+   | CPU-**Listen**ordnung gedreht (reines f64!) | 35.35 px | +25.3 % |
 
-   Die Dynamik ist **kontraktiv gegen Zustandsstörungen** (Rauschen zerfällt),
-   aber **chaotisch gegen Solver-Internika** (f32-Arithmetik, Trig-ulp,
-   fma-Kontraktion, Solve-Ordnung): Unterschiede IM Solve verschieben
-   diskrete Ereignisse — Grip-Bruch, Slip-Gate, das 260-px-Fluchtgate der
-   Beute, die Panic-Tempo-Umschaltung (1× ↔ 2.1×) — um ±1 Schritt; danach
-   verfolgen zwei gültige Physiken verschiedene Trajektorien (gemessen:
-   Beute-Δ bis 35 px als Folge, nicht als Ursache). Eine f64-CPU mit
-   gedrehter Constraint-Ordnung weicht im Fitness-Rohwert STÄRKER ab (+25 %)
-   als die echte GPU (-4 %): Schritt-Parität ist zwischen zwei gültigen
-   Solver-Implementierungen so unerreichbar wie Bit-Identität. Der f32-Mock
-   (0.0005 px) hatte nur die Zustandsrunde getestet — die absorbierte
-   Klasse — und damit ein Tor kalibriert, das keine gültige GPU-Physik
-   bestehen kann. Die Verdrahtung selbst ist sauber: pack/mirror-Offsets
-   gegen das WGSL-Struct geprüft, `attachGrip`/`releaseGrip` schreiben nur
-   gepackte Felder, `ppx/angP` hat keinen CPU-Verbraucher, Constraint-
-   Ordnung ist CPU wie GPU identisch (core.js färbt und sortiert beim Spawn).
+   Zustandsstörungen zerfallen (kontraktiv), die Ordnung innerhalb einer
+   Farbklasse ist **beliebig** — genau die Freiheit, die der parallele
+   Farb-Dispatch der GPU hat, denn Farbgruppen sind körper-disjunkt. Chaotisch
+   ist nur die Gauss-Seidel-Listenordnung der CPU über alle Farben gemischt;
+   die GPU benutzt diese Ordnung nie (sie dispatched farbweise aufsteigend,
+   identisch zu `groupConstraintsByColor`). Bleibt f32 als einzige echte
+   Fehlerquelle: 0.4…19 px je nach Seed — und nicht der Race.
 
-   **G7-Redesign** (gpu.html, 18 Urteile): In-situ-Selbstkalibrierung statt
-   fester Marken — Kontrolle C = derselbe Trainer mit gedrehter Constraint-
-   Ordnung (reines f64, CPU vs CPU) misst die Klassenschranke im selben
-   Szenario auf derselben Maschine. Tore: **maxΔ_GPU ≤ 3× maxΔ_Kontrolle** ·
-   Grip-Flags ≥ 90 % (Messung: GPU 95.9 %, Kontrolle 96.7 %) · Bruch-
-   Ereignisse ±25 % · pathLen ±10 % · NaN exakt. pop 32 statt 8 mittelt das
-   Realisierungs-Pech einzelner Tiere aus den Fitness-Rohgrößen heraus.
-   Neu im Log: Flip-Richtung (Oracle-only vs GPU-only), 1.-Flip-Schritt,
-   Beute-Δ, Control-Statistik — plus **Kopier-Button** für den Gesamtlog.
+   **G7 jetzt** (gpu.html, 20 Urteile): keine Selbstkalibrierung mehr gegen
+   eine „Klasse", sondern feste Tore aus der race-freien Emulation —
+   **maxΔ < 5 px · Grip-Flags ≥ 99.5 % · Brüche ±10 % · pathLen ±5 % ·
+   Fitness ±5 % · NaN exakt**. Fitness (`score()`) ist neu dabei: das ist die
+   Größe, nach der die ES tatsächlich selektiert, pathLen ist nur ihr
+   Rohbaustein. Der Lauf mit gedrehter CPU-Listenordnung bleibt als
+   **Diagnose-Zeile** im Log, nicht mehr als Tor.
 
    Bekannte Grenze (Hebel für 3d): der Readback ist die VOLLWelt
    (4.6 MB/Schritt bei B=512, ~6–10 ms JS-Spiegel-Kosten) — ein kompakter
@@ -397,13 +465,15 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
 ## Lokal
 
 ```bash
-node tools/harness.js          # 56 Abnahme-Checks
+node tools/harness.js          # 60 Abnahme-Checks
 node tools/harness.js --only chaos          # G7-Fehlerklassen (absorbiert vs chaotisch)
-node tools/check-wgsl.js       # Shader/Binding-Konsistenz (ohne GPU)
+node tools/check-wgsl.js       # Shader/Binding-Konsistenz (Textvergleich, ohne GPU)
+npm i --no-save naga-wasm@30.2.0 && node tools/compile-wgsl.js   # echter WGSL-Compile
 node tools/trainrun.js --gens 20 --pop 32   # CPU-Trainingslauf (~90 s)
 node tools/profile-step.js 32 400           # Phasen-Profil des Tier-Schritts
 node tools/mocktrain.js --gens 8            # Hybrid-Trainer headless (f32-Mock)
 node tools/f32parity-probe.mjs              # f64-Oracle vs f32-Solver-Emulation
+node tools/class-spread.mjs --pop 32 --seeds 7,13 --variants ctrl,f32,f32race
 python3 -m http.server 8080    # oder: npx serve .   → http://localhost:8080
 ```
 

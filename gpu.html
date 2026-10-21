@@ -62,6 +62,7 @@ import { spawnKraken, tipPosition, attachGrip, adhesionToBreakForce, BODY, ARM_R
 import { toneToCompliance } from './src/body/kraken.js';
 import { isAvailable, create, upload, uploadControls, step, download, destroy, loadWgsl } from './src/gpu/gpuworld.js';
 import { createTrainer, endGeneration } from './src/sim/train.js';
+import { score } from './src/sim/fitness.js';
 import { gpuTrainStep, beginGenerationGpu, runGpuTraining, gpuBackend } from './src/sim/gputrain.js';
 
 const $ = (id) => document.getElementById(id);
@@ -432,45 +433,55 @@ for (const N of [1, 64, 512]) {
   if (err && N === 1) fatal('GPU-Durchsatz fehlgeschlagen: ' + err);
 }
 
-// ── G7: Hybrid-Trainer — Solver-Klassen-Parität (M3c, redesign) ────
-// Ursprüngliches Design (fb622c8): Lockstep-Schritt-Parität, Tore maxΔ < 0.5 px
-// und Grip-Flags ≥ 99 %, abgeleitet aus dem f32-Mock (0.0005 px). Hardware-
-// Messung RTX 3070 Ti: maxΔ 32.69 px, 4.07 % Flag-Flips, pathLen -3.99 % — FAIL.
-// Headless-Nachmessung (tools/inject-, breaktiming-, order-, f32parity-probe):
-//
-//   Störklasse                             maxΔ/150 Schr.  pathLen-Δ
-//   Zustandsrauschen 1e-3 px/Schritt       0.0042 px       ~0 %    → absorbiert
-//   Bruchkraft-Rauschen 1e-2 relativ       0.1477 px       +0.1 %  → absorbiert
-//   f32-Emulation per-op, gleiche Ordnung  0.78…19.3 px    ≤ +2.1 %→ Klasse
-//   Solve-Ordnung gedreht (reines f64!)    35.35 px        +25.3 % → Klasse
-//   echte GPU (RTX 3070 Ti)                32.69 px        -4.0 %  → Klasse
-//
-// Die Dynamik ist KONTRAKTIV gegen Zustandsstörungen, aber CHAOTISCH gegen
-// Solver-Internika (f32-Arithmetik, Trig-ulp, fma-Kontraktion, Solve-Ordnung):
-// Unterschiede im Solve verschieben diskrete Ereignisse (Grip-Bruch, Slip-Gate,
-// Beute-Fluchtgate 260 px, Panic-Tempo-Umschaltung) um ±1 Schritt — danach
-// verfolgen zwei gültige Physiken verschiedene Trajektorien. Selbst eine
-// f64-CPU mit gedrehter Constraint-Ordnung weicht im Fitness-Rohwert STÄRKER
-// ab (+25 %) als die echte GPU (-4 %): Schritt-Parität ist zwischen zwei
-// gültigen Solver-Implementierungen unerreichbar — dasselbe Fazit wie damals
-// bei der Bit-Identität. Deshalb: STATISTISCHE Tore + IN-SITU-SELBSTKALIBRIERUNG.
-// Kontrolle C (Ordnung gedreht, reines f64) misst die Klassenschranke im
-// selben Szenario auf derselben Maschine; die GPU muss innerhalb von 3×
-// dieser Schranke bleiben. pop 32 statt 8: Fitness-Rohgrößen mitteln das
-// Realisierungs-Pech einzelner Tiere heraus.
-say('\n--- G7 Hybrid-Trainer: Solver-Klassen-Parität ---');
+// ── G7: Hybrid-Trainer — GPU-Solver gegen das f64-Oracle ───────────
+// Chronik dieses Checks, weil zwei Runden danebenlagen:
+//   fb622c8  maxΔ 32.69 px, pathLen -3.99 %  → Tore (< 0.5 px, ≥ 99 %) FAIL
+//   529fdc7  Tore auf "Solver-Klassen" gelockert (Kontrolle = CPU-Ordnung
+//            gedreht) → maxΔ 22.02 px OK, pathLen -14.8 % gegen Kontrolle
+//            -7.9 % FAIL
+// Die Prämisse von 529fdc7 war falsch. headless (tools/class-spread.mjs)
+// blieb f32-Emulation mit der Kollisions-Ordnung der CPU bei 0.36 px — die
+// Numerik war es also nicht. Die fehlende Variable: solveCollisions dispatchte
+// EINEN THREAD PRO KOLLISIONSPUNKT, aber Mantel (8 Punkte) und Armsegmente
+// (2 Punkte) teilen sich einen Körper. Mehrere Threads lasen dasselbe
+// bodies[i], korrigierten und schrieben zurück — letzter Schreiber gewinnt,
+// die übrigen Korrekturen verloren. Die CPU korrigiert kumulativ.
+// Messung pop 32, seed 7, 150 Schritte:
+//   Variante                        maxΔ      Grip-Flags  pathLen    Fitness
+//   f32, CPU-Kollisionsordnung       0.36 px   100.00 %    +0.01 %    -0.00 %
+//   f32 + Race (letzter gewinnt)    29.77 px    99.44 %   -14.71 %    -3.27 %
+//   f32 + Race (erster gewinnt)     51.10 px    99.35 %   -21.83 %    -3.94 %
+//   f32 + Jacobi (Deltas summiert)  30.54 px    99.27 %   -15.34 %    -3.69 %
+//   ECHTE RTX 3070 Ti (G7)          22.02 px    99.35 %   -14.80 %       —
+// Die Race-Zeile trifft die Hardware-Messung (pathLen -14.71 vs -14.80 %,
+// Flags 99.44 vs 99.35 %), race-frei bleibt 40× darunter, und das Vorzeichen
+// passt mechanisch: weniger Korrektur → mehr Penetration → mehr Slip/Brüche
+// → kürzerer Pfad. Also kein Chaos, sondern ein Daten-Race (WebGPU-Spec:
+// undefiniertes Verhalten bei überlappenden Writes ohne Atomics/Barrier).
+// Fix: EIN Thread pro Körper, seine Punkte sequentiell in CPU-Ordnung
+// (solver.wgsl solveCollisions + collRange Binding 8). Statisch gepinnt von
+// tools/check-wgsl.js, headless reproduziert von tools/harness.js --only chaos
+// (coll-race-repro) und tools/class-spread.mjs.
+// Erwartung JETZT auf der RTX 3070 Ti: maxΔ < 5 px, Flags ≥ 99.5 %,
+// pathLen ±5 %, Fitness ±5 % — Fitness ist die eigentliche Selektionsgröße.
+// Die Kontrolle C (CPU-Listenordnung gedreht, reines f64) läuft weiter mit,
+// aber nur noch als DIAGNOSE: Sie zeigt, was Solve-Ordnung allein anrichtet,
+// und die GPU benutzt diese Ordnung nicht (sie dispatched farbweise wie die
+// CPU nach groupConstraintsByColor; innerhalb einer Farbe ist die Ordnung
+// messbar frei — harness-Check color-order-free: maxΔ 0.00e+0).
+say('\n--- G7 Hybrid-Trainer: GPU-Solver gegen das f64-Oracle ---');
 {
   const OPTS = { popSize: 32, stepsPerGen: 150, seed: 7, prey: 2 };
   const STEPS = 150;
   const A = createTrainer(OPTS);            // Oracle: reine CPU-Physik (f64)
-  const B = createTrainer(OPTS);            // Hybrid: GPU-Physik + Spiegel
-  const C = createTrainer(OPTS);            // Kontrolle: CPU-Physik, Ordnung gedreht
+  const B = createTrainer(OPTS);            // Hybrid: GPU-Physik + Zustandsspiegel
+  const C = createTrainer(OPTS);            // Diagnose: CPU-Physik, Listenordnung gedreht
   const gpu = await create(B.sim.world, B.sim.map, wgsl, device);
   const backend = gpuBackend(gpu);
   beginGenerationGpu(A, null);
   beginGenerationGpu(B, backend);
   beginGenerationGpu(C, null);
-  C.sim.world.constraints.reverse();        // dieselbe Physik, andere Solve-Ordnung
+  C.sim.world.constraints.reverse();
 
   const mk = () => ({ maxD: 0, sumD: 0, mism: 0, tot: 0, onlyOracle: 0, onlyVar: 0,
                       firstFlip: -1, brkA: 0, brkB: 0, preyD: 0, worstI: -1 });
@@ -499,25 +510,32 @@ say('\n--- G7 Hybrid-Trainer: Solver-Klassen-Parität ---');
     }
     for (let e = 0; e < A.sim.entities.length; e++) {
       const ea = A.sim.entities[e];
-      const eb = B.sim.entities[e], ec = C.sim.entities[e];
-      S.preyD = Math.max(S.preyD, Math.hypot(ea.x - eb.x, ea.y - eb.y));
-      K.preyD = Math.max(K.preyD, Math.hypot(ea.x - ec.x, ea.y - ec.y));
+      S.preyD = Math.max(S.preyD, Math.hypot(ea.x - B.sim.entities[e].x, ea.y - B.sim.entities[e].y));
+      K.preyD = Math.max(K.preyD, Math.hypot(ea.x - C.sim.entities[e].x, ea.y - C.sim.entities[e].y));
     }
   }
   const nanA = A.sim.world.stats.nan, nanB = B.sim.world.stats.nan;
-  const pl = (tr) => tr.sim.creatures.reduce((s, c) => s + c.pathLen, 0) / OPTS.popSize;
-  const plA = pl(A), plB = pl(B), plC = pl(C);
-  const bound = Math.max(1, 3 * K.maxD);
-  verdict('G7 NaN', `Lockstep ${OPTS.popSize} Tiere × ${STEPS} NN-Schritte, Beute aktiv, f64-Kontrolle mitläufig`, nanA, nanB, nanA === 0 && nanB === 0, false);
-  verdict('G7 Klassen-Schranke', `maxΔ GPU ≤ 3× maxΔ Kontrolle (Ordnung gedreht, f64: ${K.maxD.toFixed(2)} px)`, K.maxD, S.maxD, S.maxD <= bound, '≤ 3× Kontrolle');
-  verdict('G7 Grip-Flags', `Saugnapf-Zustände stimmen überein (${S.tot} Vergleiche; Kontrolle: ${(100 * (1 - K.mism / K.tot)).toFixed(2)} %)`, 100, 100 * (1 - S.mism / S.tot), S.mism / S.tot < 0.10, '≥ 90 %');
-  verdict('G7 Bruch-Ereignisse', 'Σ gebrochene Saugnapf-Schritte über alle Tiere (Oracle → GPU)', S.brkA, S.brkB, Math.abs(S.brkB - S.brkA) <= Math.max(3, 0.25 * S.brkA), '±25 %');
-  verdict('G7 Pfadlänge', 'Ø zurückgelegter Weg — die Fitness-Rohgröße', plA, plB, Math.abs(plA - plB) < 0.10 * Math.max(plA, 1), '±10 %');
-  say(`    Kontrolle (Ordnung gedreht, f64):  maxΔ ${K.maxD.toFixed(4)} px · mean ${(K.sumD / (STEPS * OPTS.popSize)).toFixed(4)} · Flags ${(100 * (1 - K.mism / K.tot)).toFixed(2)} % · Brüche ${K.brkA}→${K.brkB} · pathLen ${plC.toFixed(2)} (${(100 * (plC - plA) / Math.max(plA, 1e-9)).toFixed(1)} %) · Beute-Δ ${K.preyD.toFixed(2)} px`);
-  say(`    GPU:                             maxΔ ${S.maxD.toFixed(4)} px · mean ${(S.sumD / (STEPS * OPTS.popSize)).toFixed(4)} · Flags ${(100 * (1 - S.mism / S.tot)).toFixed(2)} % · Brüche ${S.brkA}→${S.brkB} · pathLen ${plB.toFixed(2)} (${(100 * (plB - plA) / Math.max(plA, 1e-9)).toFixed(1)} %) · Beute-Δ ${S.preyD.toFixed(2)} px`);
+  const mean = (v) => v.reduce((a, b) => a + b, 0) / v.length;
+  const plOf = (tr) => mean(tr.sim.creatures.map(c => c.pathLen));
+  const fitOf = (tr) => mean(tr.sim.creatures.map(c => score(c, OPTS)));
+  const plA = plOf(A), plB = plOf(B), plC = plOf(C);
+  const fA = fitOf(A), fB = fitOf(B), fC = fitOf(C);
+  const dev = (x, ref) => 100 * (x - ref) / Math.max(1e-9, Math.abs(ref));
+  const plDevB = dev(plB, plA), plDevC = dev(plC, plA);
+  const fDevB = dev(fB, fA), fDevC = dev(fC, fA);
+
+  verdict('G7 NaN', `Lockstep ${OPTS.popSize} Tiere × ${STEPS} Schritte, Beute aktiv, f64-Oracle + gedrehte Ordnung mitläufig`, nanA, nanB, nanA === 0 && nanB === 0, false);
+  verdict('G7 maxΔ Position', 'Größter Positionsunterschied eines Mantels über 150 Schritte (race-freie f32-Emulation: 0.36 px)', 0, S.maxD, S.maxD < 5, '< 5 px');
+  verdict('G7 Grip-Flags', `Saugnapf-Zustände identisch über ${S.tot} Vergleiche`, 100, 100 * (1 - S.mism / S.tot), S.mism / S.tot <= 0.005, '≥ 99.5 %');
+  verdict('G7 Bruch-Ereignisse', 'Σ gebrochene Saugnapf-Schritte über alle Tiere (Oracle → GPU)', S.brkA, S.brkB, Math.abs(S.brkB - S.brkA) <= Math.max(3, 0.10 * S.brkA), '±10 %');
+  verdict('G7 Pfadlänge', 'Ø zurückgelegter Weg — Rohbaustein der Fitness', plDevC, plDevB, Math.abs(plDevB) < 5, '±5 %');
+  verdict('G7 Fitness', 'Ø score() — die Größe, nach der die ES tatsächlich selektiert', fDevC, fDevB, Math.abs(fDevB) < 5, '±5 %');
+
+  say(`    GPU:      maxΔ ${S.maxD.toFixed(4)} px · mean ${(S.sumD / (STEPS * OPTS.popSize)).toFixed(4)} · Flags ${(100 * (1 - S.mism / S.tot)).toFixed(3)} % · Brüche ${S.brkA}→${S.brkB} · pathLen ${plA.toFixed(2)}→${plB.toFixed(2)} (${plDevB.toFixed(2)} %) · Fitness ${fA.toFixed(2)}→${fB.toFixed(2)} (${fDevB.toFixed(2)} %) · Beute-Δ ${S.preyD.toFixed(2)} px`);
+  say(`    Diagnose (CPU-Listenordnung gedreht, f64): maxΔ ${K.maxD.toFixed(2)} px · Flags ${(100 * (1 - K.mism / K.tot)).toFixed(2)} % · pathLen ${plDevC.toFixed(2)} % · Fitness ${fDevC.toFixed(2)} % · Beute-Δ ${K.preyD.toFixed(2)} px`);
   say(`    GPU-Detail: 1. Flip @ Schritt ${S.firstFlip} · Flip-Richtung Oracle-only ${S.onlyOracle}, GPU-only ${S.onlyVar} · größtes Δ bei Tier ${S.worstI}`);
-  say('    Klassen-Einordnung: Zustandsebene kontraktiv (Rauschen 1e-3 px/Schr → 0.004 px), Solver-Internika chaotisch');
-  say('    (Ordnung gedreht f64 → 35.4 px/+25 % pathLen; f32-Emulation → 0.8…19.3 px). Kopflos pinnt tools/harness.js --only chaos.');
+  say('    Erwartung aus der race-freien f32-Emulation (headless, pop 32): maxΔ 0.36 px · Flags 100.00 % · pathLen +0.01 % · Fitness -0.00 %.');
+  say('    War es vor dem Fix: maxΔ 22.02 px · Flags 99.35 % · pathLen -14.80 % — reproduziert von f32 + Kollisions-Race (29.77 px · 99.44 % · -14.71 %).');
   destroy(gpu);
 }
 
