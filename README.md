@@ -63,7 +63,7 @@ src/gpu/gpuworld.js    Buffer/Bind-Groups, upload/packControls, step, download/m
 src/sim/gputrain.js    Hybrid-Trainer: Physik GPU, Sinne/Netz/ES CPU, Zustandsspiegel.
 src/render/            EINZIGE DOM-abhängige Schicht (view.js), Platzhalter-Gang (demo.js),
                        Viewer-Takt (pace.js — DOM-frei, Checks pace-*).
-tools/harness.js       71 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
+tools/harness.js       73 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
 tools/profile-step.js  Zerlegt den Tier-Schritt in Phasen (µs) — Architektur-Entscheide.
 tools/mocktrain.js     Hybrid-Trainer headless ohne Device (Passthrough/f32-Mock).
 tools/f32solver.mjs    f32-Solver-Emulation (WGSL-Semantik per-op, 4 Kollisions-Modi).
@@ -73,6 +73,8 @@ tools/compile-wgsl.js  Echter WGSL-Compile (naga als WASM) — optional, in der 
 tools/gaitprobe.mjs    Misst den Gang: Greif-Ereignisse pro Arm gegen das, was score() sieht.
 tools/strideprobe.mjs  Skript-Gänge gegen das trainierte Netz — physikalischer Kopfraum.
 tools/demogait-probe.mjs Platzhalter gegen Skript-Demo-Gänge — warum legacy weiterläuft.
+tools/spawnnoise-probe.mjs Spawn-Lotterie vs. Policy-Signal im ES-Gradienten — fand den Such-Flaschenhals.
+tools/theta-eval.mjs     Gespeichertes θ-Genom auf fremder Karte — Generalisierung, nicht Nischenfit.
 tools/*-probe.mjs      Messproben: Lyapunov, Injektion, Bruch-Timing, Ordnung, f32-Parität.
 ```
 
@@ -134,7 +136,7 @@ voll gestellt   (900 N Grenze)  → hält unter demselben Zug
 ## Abnahme: `node tools/harness.js`
 
 ```
-71/71 Checks bestanden
+73/73 Checks bestanden
   passiv        exakt in Ruhe            Pfad 0.00e+0 px        (v2: 964 px)
   slack-fixpoint Störung < slack         Δ = 0.00e+0 px, v = 0  (f32-Boden: GPU driftete 1.28 px)
   slack-corrects 25× slack korrigiert    0.050 px → 1.95e-3 px
@@ -143,14 +145,16 @@ voll gestellt   (900 N Grenze)  → hält unter demselben Zug
   prey-determinism Beute aus Seed identisch (fix: makeEntity zog Math.random())
   gputrain-identical Hybrid = CPU-Trainer Fitness bit-identisch, 2 Gen × 8 Tiere × 120 Schritte
   noise-absorbed Zustandsrauschen zerfällt 1e-3 px/Schritt → maxΔ 3.9e-3 px (kontraktiv)
-  order-chaos    CPU-Listenordnung gedreht (f64) maxΔ 35.35 px — die CPU ist ordnungs-chaotisch
-  f32-class      f32-Emulation race-frei: maxΔ 0.78 px, pathLen +0.24 %, NaN 0
-  coll-race-repro Kollisions-Race reproduziert die GPU-Divergenz: 74.5 px vs 0.78 px race-frei
-  coll-race-physics Physik dahinter: 28.4 % Korrekturen verworfen, 5.80× Rest-Penetration
+  order-chaos    CPU-Listenordnung gedreht (f64) maxΔ 27.87 px — die CPU ist ordnungs-chaotisch
+  f32-class      f32-Emulation race-frei: maxΔ 0.032 px, pathLen -0.01 %, NaN 0
+  coll-race-repro Kollisions-Race reproduziert die GPU-Divergenz: 9.41 px vs 0.032 px race-frei
+  coll-race-physics Physik dahinter: 22.8 % Korrekturen verworfen, 7.35× Rest-Penetration
   fit-ratchet    Rattern zahlt nicht zweimal 129.7 px Weg → 11.1 px gutgeschrieben (vorher 30.3)
   fit-static-floor Stillstand lohnt nicht    halten −0.1 vs Gang 186.7 Punkte (vorher 30.9 vs 262.4)
   fit-stride-farm Adhäsions-Tretmühle       102 Greif-Ereignisse → 0 gewertete Schritte
   fit-ranks-travel Score folgt der Distanz   Verhältnis 0.33 vs 0.34 (vorher 0.71 vs 0.34)
+  crn-pair-noise Identisches Genom im Paar: mit CRN Δ = 0 exakt, ohne Δ 238.6 Punkte
+  crn-spawn-ring CRN-Spawns im Ring 26…118.5 px Wandabstand (gemessen 42.4…105.8), paaridentisch
   color-order-free Ordnung innerhalb einer Farbklasse ist frei: maxΔ 0.00e+0 — GPU-Dispatch exakt
   coll-grouping    groupCollPoints + Shader-Weg = _solveCollisions: 128 Posen, 26 356 Kontakte, Δ = 0
   wgsl-compile     solver.wgsl compiliert wirklich (naga 30 als WASM), nicht nur Textvergleich
@@ -351,12 +355,76 @@ nicht aus CPU-Batching. Erwartet: 10.000–100.000 Kraken-Schritte/s.
    über drei Seeds (20.9…38.2 px) ist größer als jeder Effekt, den die
    Fitness-Revision hatte.
 
-   Offen bleibt damit die **Suche**, nicht die Belohnung: der beste Skript-Gang
-   kommt 64.4 px weit, das trainierte Netz 24–30 px — 3.4× physikalischer
-   Kopfraum, den die ES nicht hebt, weil sie die Phasenversetzung zwischen sechs
-   Armen erst entdecken müsste. Die handgeschriebene Gangkurve bleibt trotzdem
+   Offen blieb damit die **Suche** — und die Messung hat ihren Grund gefunden:
+   nicht die fehlende Phasenversetzung, sondern **Spawn-Lotterie im Gradienten**
+   (Abschnitt direkt unten). Die handgeschriebene Gangkurve bleibt trotzdem
    draussen (v2: Trend −9.34 px/Gen MIT Kurve gegen +5.14 ohne); die Sonde ist
    ein Messstand, kein Produktbestandteil.
+
+   ── Der Such-Flaschenhals war Spawn-Lärm (CRN-Fix) ────────────────────────
+
+   `resetCreatures` zog JEDER Generation frische Zufalls-Spawns — auch für die
+   beiden Hälften desselben Spiegelpaars (θ+σε, θ−σε). Der Paardifferenz-
+   Schätzer maß damit vor allem, welche Zufallsposition günstiger lag, nicht
+   welches Genom besser ist. Gemessen (`tools/spawnnoise-probe.mjs`, pop 64,
+   500 Schritte, seed 1):
+
+   | Bedingung | Score-Spanne | Paardifferenz-sd |
+   |---|---|---|
+   | identisches Genom, verschiedene Spawns | 21…367 | **46.3 Punkte** = Noise-Floor |
+   | ES-Generation (θ=0, σ=0.06) | 0…241 | 45.6 Punkte ≈ Noise-Floor |
+   | Signal-Anteil var(B) − var(A) | — | **≈ 0** (SNR 0.000) |
+
+   Der Generation-0-Gradient war reines Rauschen. Fix: **CRN-Spawns**
+   (`crnSpawns`, Default): das Spiegelpaar teilt Spawn+Heading, jeder Slot
+   behält seinen Spawn über Generationen (Common Random Numbers — die
+   Standard-Varianzreduktion für ES, die hier schlicht fehlte). Die
+   Spawn-Regel ist ein Ring: `SPAWN_CLEAR (26 px) ≤ Wandabstand ≤ ARM_REACH
+   (118.5 px)`. Beide alten Pfade waren falsch: `findSpawn(ARM_REACH+20)`
+   setzt das Tier ≥ 138 px von jeder Wand — es ist NICHTS greifbar (pathLen
+   2.9 px / 150 Schritte, gemessen am order-chaos-Szenario); der alte
+   Fallback `60+rnd·(w−120)` spawnte regelmäßig IN die Wand. Mit CRN:
+   Noise-Floor **exakt 0.000000** Punkte, dieselbe σ-Perturbation liefert
+   18.6 Punkte Signal pro Paar — gepinnt von den Checks `crn-pair-noise`
+   (ohne CRN: Δ 238.6 Punkte bei identischem Genom) und `crn-spawn-ring`.
+   gpu.html G7/G8 fahren denselben Trainer — die Absolutzahlen des
+   19/19-Protokolls (Build `4b32a00`) stammen vom alten Spawn-Regime; die
+   Tore sind relativ (maxΔ, %, ±10 %) und gelten unverändert.
+
+   **130-Generationen-A/B** (pop 64, 500 Schritte/Gen, ~23 min/Lauf auf ~3000
+   Kraken-Schritte/s; θ = ES-Mittel, evaluiert auf 64 FRISCHEN Ring-Spawns,
+   Generalisierung auf Karten, die das Training nie gesehen hat
+   `tools/theta-eval.mjs`; Genome via `trainrun --out`):
+
+   | Lauf | θ netto px (Trainingskarte) | netto px (fremde Karten 777/999) | Anker | Wechselgriffe |
+   |---|---|---|---|---|
+   | CRN seed 1 | **185.1** | **198.3 / 177.2** | 75 % | 118 |
+   | CRN seed 2 | 91.5 | 80.9 / 79.3 | 100 % | 335 |
+   | ohne CRN seed 1 | 124.6 | 120.6 / 125.6 | 99 % | 425 |
+   | ohne CRN seed 2 | 87.6 | 79.0 / 80.1 | 100 % | 292 |
+
+   Drei Befunde, sauber getrennt:
+   1. **Lokomotion ist lernbar.** Alle vier Läufe schlagen den besten
+      Skript-Gang auf derselben Aufgabenverteilung deutlich: sync T=32 kommt
+      auf 57.4/46.7 px (Karte seed 1/2), wave T=32 auf 46.4/39.8 px
+      (`tools/demogait-probe.mjs`, neu auf Ring-Spawns gemessen). Das
+      „24–30-px-Plateau" der Fitness-A/B-Messung war ein Artefakt von
+      20-Generationen-Läufen — bei 130 Generationen lernt auch der alte Code.
+   2. **θ transferiert.** Fremde Karten liegen innerhalb ±12 % der
+      Trainingskarte (CRN seed 1: 185 → 198/177 px). Das ist ein Gang, keine
+      Nischenanpassung an ein Terrain. `genomes/walker-crn-s1.json` liegt im Repo.
+   3. **Der CRN-Effekt aufs Ergebnis ist ein Trend, kein Beweis.** Ø 138.3 px
+      (CRN) vs. Ø 106.1 px (ohne), +30 % — aber bei n=2 Seeds pro Arm mit
+      überlappenden Spannen (91.5…185.1 vs. 87.6…124.6). Der MECHANISMUS ist
+      gepinnt (Noise-Floor 46.3 → 0, Checks), der Lernvorteil bräuchte mehr
+      Seeds. Seed-Effekt dominiert beide Arme: seed 1 wird ein „Reisender"
+      (Anker 75–99 %, 124–185 px netto), seed 2 ein „Anker-und-Treter"
+      (Anker 100 %, ~88 px netto, 292–335 Wechselgriffe).
+
+   Für die Leitfrage — was ist für Spiel-KI lernbar? — ist das die erste
+   positive Antwort mit Zahl: ein 3644-Gewichte-Netz, das einen sechsarmigen
+   Weichkörper-Kraken 3.2–3.8× weiter trägt als der beste handgetaktete Gang,
+   gefunden von 8320 Evaluationen (2.3 Evaluationen pro Gewicht).
 4. **[fertig: 3b — 11/11 im Browser validiert] GPU-Portierung.**
    `src/gpu/solver.wgsl` ist ein 1:1-Port des CPU-Lösers (integrieren →
    Constraint-Iterationen → Kollision → Abschluss → Grip-Bruch), `src/gpu/gpuworld.js`
@@ -664,9 +732,16 @@ keiner der Kandidaten läuft langfristig besser.
 Kurzfristig führt `sync T=32` (52.5 px), langfristig ist es ein Kreisel
 (12.2 Umdrehungen für 36.5 px netto). Der Platzhalter hat mit Abstand den
 besten Netto-Weg pro Umdrehung und 100 % Anker-Zeit — er bleibt; die
-Präsentation macht seine Drift sichtbar. Echtes Laufen ist Aufgabe der
-Evolution (Stand dazu: Punkt 3, `strideprobe`: 64.4 px Skript-Kopfraum
-gegenüber 24–30 px evolviert = Suchproblem, kein Physikproblem).
+Präsentation macht seine Drift sichtbar.
+
+Messstandard-Hinweis: die Tabelle oben stammt vom alten Lotterie-Spawn
+(seed 7). Neu auf CRN-Ring-Spawns gemessen (seed 1/2, pop 64, 500 Schritte):
+legacy 36.1/35.6 px, sync T=32 57.4/46.7 px, wave T=32 46.4/39.8 px —
+Reihenfolge unverändert. **Echtes Laufen ist nicht mehr Aufgabe der
+Evolution, sondern ihr Ergebnis**: 130-Generationen-Läufe erreichen θ-Werte
+von 87.6…185.1 px auf derselben Verteilung — 1.5–3.2× der beste Skript-Gang
+(Milestone 3, Abschnitt „CRN-Fix"). Das Sieger-Genom liegt als
+`genomes/walker-crn-s1.json` im Repo; ein Viewer-Loader dafür fehlt noch.
 
 **`train.html` — Training-Konsole.** Interaktiver Trainer auf denselben
 Modulen wie gpu.html G8 (`src/sim/train.js`, `src/sim/gputrain.js`): Physik
@@ -695,11 +770,14 @@ Log-Meldung), Sinne/Netz/ES auf der CPU über den Zustandsspiegel.
 ## Lokal
 
 ```bash
-node tools/harness.js          # 71 Abnahme-Checks
+node tools/harness.js          # 73 Abnahme-Checks
 node tools/harness.js --only chaos          # G7-Fehlerklassen (absorbiert vs chaotisch)
 node tools/check-wgsl.js       # Shader/Binding-Konsistenz (Textvergleich, ohne GPU)
 npm i --no-save naga-wasm@30.2.0 && node tools/compile-wgsl.js   # echter WGSL-Compile
 node tools/trainrun.js --gens 20 --pop 32   # CPU-Trainingslauf (~90 s)
+node tools/trainrun.js --gens 130 --pop 64 --seed 1 --out theta.json  # Siegerlauf-A/B (~23 min)
+node tools/spawnnoise-probe.mjs             # Spawn-Lotterie vs. Policy-Signal (~45 s)
+node tools/theta-eval.mjs --theta theta.json --seed 777   # θ auf fremder Karte (~15 s)
 node tools/profile-step.js 32 400           # Phasen-Profil des Tier-Schritts
 node tools/mocktrain.js --gens 8            # Hybrid-Trainer headless (f32-Mock)
 node tools/f32parity-probe.mjs              # f64-Oracle vs f32-Solver-Emulation

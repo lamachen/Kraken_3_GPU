@@ -4,20 +4,25 @@
  *
  *   node tools/trainrun.js [--gens 20] [--pop 32] [--steps 500] [--prey 0] [--seed 7]
  */
-import { createTrainer, beginGeneration, trainStep, endGeneration, N_IN, N_W } from '../src/sim/train.js';
+import { createTrainer, beginGeneration, trainStep, endGeneration, rerollSpawns, N_IN, N_W } from '../src/sim/train.js';
+import { score } from '../src/sim/fitness.js';
 import { OUT_DIM, HIDDEN } from '../src/brain/net.js';
 
 const argv = process.argv.slice(2);
 const arg = (n, d) => { const i = argv.indexOf('--' + n); return i >= 0 ? Number(argv[i + 1]) : d; };
+const strArg = (n, d) => { const i = argv.indexOf('--' + n); return i >= 0 ? argv[i + 1] : d; };
 const GENS = arg('gens', 20), POP = arg('pop', 32), STEPS = arg('steps', 500), PREY = arg('prey', 0), SEED = arg('seed', 7);
+const CRN = arg('crn', 1), SIGMA = arg('sigma', 0.06), LR = arg('lr', 0.030);
+const OUT = strArg('out', '');
 
 console.log(`Training: ${GENS} Generationen, Population ${POP} (=${POP >> 1} gespiegelte Paare), ${STEPS} Schritte/Gen, ${PREY} Beute, Seed ${SEED}`);
+console.log(`ES: sigma ${SIGMA}, lr ${LR} · CRN-Spawns: ${CRN ? 'an (Paar teilt Spawn+Heading, über Generationen fix)' : 'aus (frische Zufalls-Spawns — Noise-Floor 46.3 Punkte/Paar, gemessen)'}`);
 console.log(`Netz: ${N_IN} Eingänge → ${HIDDEN} → ${HIDDEN} → ${OUT_DIM}  =  ${N_W} Gewichte`);
 console.log(`Evaluationsbudget: ${POP} Genome/Gen bei ${N_W} Gewichten = ${(N_W / POP).toFixed(0)}:1   (Kraken_v2: 55:1)\n`);
 console.log(' gen |   best |   mean | sigma | Zug-px | Anker | netto | gerade | Zyklen | Schritte | Umdreh |  Eff  | s/Gen');
 console.log('-----+--------+--------+-------+--------+-------+-------+--------+--------+----------+--------+-------+------');
 
-const tr = createTrainer({ popSize: POP, stepsPerGen: STEPS, seed: SEED, prey: PREY });
+const tr = createTrainer({ popSize: POP, stepsPerGen: STEPS, seed: SEED, prey: PREY, crnSpawns: !!CRN, sigma: SIGMA, lr: LR });
 const hist = [];
 const t00 = Date.now();
 for (let g = 0; g < GENS; g++) {
@@ -68,3 +73,37 @@ for (const [k, label] of [['best', 'Score'], ['gripPull', 'Zug-px'], ['disp', 'n
 }
 console.log('\nGesamtzeit: ' + total.toFixed(1) + ' s für ' + GENS + ' Generationen = ' +
   (total / GENS).toFixed(1) + ' s/Gen  (' + (POP * STEPS * GENS / total).toFixed(0) + ' Kraken-Schritte/s)');
+
+// ── θ-Endmessung auf FRISCHEN Spawns ──────────────────────────────────────
+// Die ES optimiert θ auf den festen Trainings-Spawns (CRN). Was zählt, ist,
+// ob das Ergebnis auf Spawns generalisiert, die es beim Training nie gesehen
+// hat. rerollSpawns(pairShared=false) gibt jedem der POP Slots einen eigenen,
+// ring-validierten Spawn auf derselben Karte → POP unabhängige Stichproben.
+// Referenz: die besten getakteten Skript-Gänge (tools/demogait-probe.mjs).
+{
+  const EVAL_STEPS = STEPS;
+  const evTr = createTrainer({ popSize: POP, stepsPerGen: EVAL_STEPS, seed: SEED, prey: PREY });
+  rerollSpawns(evTr, false);                       // frische Spawns, kein Paar-Sharing
+  beginGeneration(evTr);
+  const theta = tr.es.theta;
+  for (let i = 0; i < POP; i++) evTr.genomes.set(theta, i * N_W);
+  for (let s = 0; s < EVAL_STEPS; s++) trainStep(evTr);
+  const C = evTr.sim.creatures;
+  const avg = (f) => C.reduce((a, c) => a + f(c), 0) / C.length;
+  const disp = avg(c => c.maxDisplacement);
+  const net = avg(c => Math.hypot(c.x - c.spawn.x, c.y - c.spawn.y));
+  const straight = avg(c => c.pathLen > 1 ? c.maxDisplacement / c.pathLen : 0);
+  const anchor = avg(c => c.steps ? c.anchoredSteps / c.steps : 0);
+  const strides = avg(c => c.strides);
+  const spin = avg(c => c.angularAccum / (Math.PI * 2));
+  const bestScore = Math.max(...C.map(c => score(c, evTr.opts)));
+  console.log(`\n── θ-Endmessung (${EVAL_STEPS} Schritte, ${POP} FRISCHE Spawns auf Karte seed ${SEED}) ──`);
+  console.log(`  Ø Netto-Disp ${disp.toFixed(1)} px · Ø End-Distanz ${net.toFixed(1)} px · Geradlinigkeit ${(straight * 100).toFixed(0)} %`);
+  console.log(`  Anker ${(anchor * 100).toFixed(0)} % · Wechselgriffe ${strides.toFixed(1)} · Spin ${spin.toFixed(2)} Umdr · bester Score ${bestScore.toFixed(0)}`);
+  console.log(`  Referenz Skript-Gänge (Ring-Spawns, 500 Schr., Karte seed 1/2): sync T=32 57.4/46.7 px · wave T=32 46.4/39.8 px · legacy 36.1/35.6 px`);
+  if (OUT) {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(OUT, JSON.stringify(Array.from(theta)));
+    console.log(`  θ (${theta.length} Gewichte) → ${OUT}`);
+  }
+}

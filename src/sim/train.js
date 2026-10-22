@@ -23,9 +23,21 @@ export function createTrainer(opts = {}) {
     prey: 0,
     sigma: 0.06,
     lr: 0.030,
+    // CRN (Common Random Numbers): jedes Spiegelpaar teilt Spawn+Heading und
+    // jeder Slot behält ihn über alle Generationen. Ohne das zieht
+    // resetCreatures frische Zufalls-Spawns — sogar für die beiden Hälften
+    // desselben Paars — und der Gradientenschätzer misst fast nur Spawn-
+    // Lotterie. Gemessen (tools/spawnnoise-probe.mjs, pop 64, 500 Schritte):
+    // identisches Genom liefert Score 21…367 (Paardifferenz-sd 46.3 Punkte),
+    // eine echte ES-Generation (σ=0.06) hat Paardifferenz-sd 45.6 — der
+    // Lärm-Anteil an der Varianz liegt bei ~100 %, das Policy-Signal ist
+    // nicht messbar. crnSpawns:false stellt das alte Verhalten bitgenau
+    // wieder her (für A/B-Messungen).
+    crnSpawns: true,
     ...opts,
   };
-  const pop = o.popSize;
+  const pop = o.popSize % 2 === 0 ? o.popSize : o.popSize + 1;  // createES rundet sonst still auf
+  o.popSize = pop;
   const sim = createSim({ ...o, creatures: pop, prey: o.prey });
   const es = createES(N_W, { popSize: pop, sigma: o.sigma, lr: o.lr });
 
@@ -52,8 +64,60 @@ export function createTrainer(opts = {}) {
     sim, es, opts: o, rnd, genomes, inputs, outputs, scratch, controls, fitness,
     gen: 0, stepInGen: 0, history: [],
   };
+  if (o.crnSpawns) sim.spawnCache = crnSpawns(sim, pop, rnd, true);
   seedPopulation(tr);
   return tr;
+}
+
+/**
+ * Spawn-Regel fürs Training: FREI, aber mit Greifbarem in Reichweite.
+ *
+ * Das Initial-Spawn aus createSim nutzt `findSpawn(map, ARM_REACH + 20)` —
+ * ≥ 138.5 px Wandabstand, MEHR als die Armreichweite (118.5 px). Ein Tier
+ * dort kann nichts greifen und sich nicht fortbewegen; gemessen am
+ * order-chaos-Szenario des Harness: pathLen 2.9 px in 150 Schritten, nur
+ * Drift. Der alte resetCreatures-Fallback (60 + rnd·(w−120), ungeprüft)
+ * spawnte dagegen regelmäßig IN die Wand. Beides falsch fürs Training.
+ * Der Ring hier: SPAWN_CLEAR ≤ sdf.d ≤ ARM_REACH — Mantel frei (keine
+ * Penetrations-Explosion beim Respawn), aber eine Wand in Griffweite,
+ * damit Lokomotion ab Schritt 0 physikalisch möglich ist.
+ */
+export const SPAWN_CLEAR = 26;
+
+/**
+ * CRN-Spawns ziehen. pairShared=true: beide Slots eines Spiegelpaars teilen
+ * Position UND Heading — die Paardifferenz wird rauschfrei (gemessen mit
+ * tools/spawnnoise-probe.mjs: Noise-Floor 46.3 → exakt 0.0 Punkte).
+ */
+export function crnSpawns(sim, pop, rnd, pairShared = true) {
+  const { map } = sim;
+  const W = map ? map.width : 240, H = map ? map.height : 240;
+  const cache = [];
+  for (let i = 0; i < pop; i++) {
+    if (pairShared && (i & 1)) { cache.push(cache[i - 1]); continue; }
+    let sp = null;
+    if (map) {
+      for (let t = 0; t < 500 && !sp; t++) {
+        const x = 60 + rnd() * Math.max(1, W - 120);
+        const y = 60 + rnd() * Math.max(1, H - 120);
+        const hit = map.sdf(x, y);
+        if (hit && hit.d >= SPAWN_CLEAR && hit.d <= ARM_REACH) sp = { x, y };
+      }
+    }
+    if (!sp) sp = { x: 60 + rnd() * Math.max(1, W - 120), y: 60 + rnd() * Math.max(1, H - 120) };
+    cache.push({ x: sp.x, y: sp.y, angle: rnd() * Math.PI * 2 });
+  }
+  return cache;
+}
+
+/**
+ * Spawns neu ziehen — für Generalisierungs-Messungen (θ auf frischen Aufgaben).
+ * Derselbe Ring-Sampler wie beim Training; pairShared=false gibt jedem Slot
+ * einen eigenen Spawn (mehr unabhängige Stichproben pro Evaluation).
+ */
+export function rerollSpawns(tr, pairShared = true) {
+  tr.sim.spawnCache = crnSpawns(tr.sim, tr.sim.creatures.length, tr.rnd, pairShared);
+  return tr.sim.spawnCache;
 }
 
 function seedPopulation(tr, baseGenome) {
@@ -94,13 +158,15 @@ function resetCreatures(tr) {
     const sp = sim.map && sim.spawnCache ? sim.spawnCache[i] : null;
     const x = sp ? sp.x : 60 + rnd() * (sim.map.width - 120);
     const y = sp ? sp.y : 60 + rnd() * (sim.map.height - 120);
-    respawnCreature(sim, c, x, y, rnd() * Math.PI * 2);
+    // Heading: mit Cache DERSELBE pro Slot und Generation (CRN — sonst steckt
+    // die Heading-Lotterie im Paardifferenz-Schätzer); ohne Cache wie vorher
+    // frisch gezogen.
+    respawnCreature(sim, c, x, y, sp ? sp.angle : rnd() * Math.PI * 2);
   }
 }
 
 /** Ein Tier an neuer Position neu aufsetzen, ohne die Welt neu zu bauen. */
-import { spawnKraken, ARM_REACH } from '../body/kraken.js';
-import { findSpawn } from '../world/map.js';
+import { ARM_REACH } from '../body/kraken.js';
 import { measureReach } from './fitness.js';
 function respawnCreature(sim, c, x, y, angle) {
   const w = sim.world;

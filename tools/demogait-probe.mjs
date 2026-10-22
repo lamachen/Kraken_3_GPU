@@ -16,7 +16,7 @@
  * (angularAccum/2π), Ankeranteil — Mittel über alle Tiere.
  */
 import { stepSim, applyControl } from '../src/sim/core.js';
-import { createTrainer, beginGeneration } from '../src/sim/train.js';
+import { createTrainer, beginGeneration, rerollSpawns } from '../src/sim/train.js';
 import { demoControl } from '../src/render/demo.js';
 
 const argv = process.argv.slice(2);
@@ -60,6 +60,13 @@ CONFIGS.push(['sync   T=32', timedGait(32, 'sync')]);
 // ── Messlauf: eine Konfiguration über POP identische Spawns ─────────
 function run(name, fn, steps, pop) {
   const tr = createTrainer({ popSize: pop, stepsPerGen: steps, seed: SEED, prey: 0 });
+  // Messstandard = θ-Endmessung aus tools/trainrun.js: frische Ring-Spawns
+  // (SPAWN_CLEAR ≤ Wandabstand ≤ ARM_REACH), jeder Slot ein eigener — damit
+  // sind Skript-Gänge und evolvierte Genome auf derselben Aufgabenverteilung
+  // vergleichbar. Die historischen Referenzen (legacy 96.1 px / sync 52.5 px)
+  // stammen vom alten resetCreatures-Fallback (ungeprüfte Lotterie-Spawns,
+  // teils in der Wand) und sind mit diesen Zahlen NICHT direkt vergleichbar.
+  rerollSpawns(tr, false);
   beginGeneration(tr);                                   // ⇒ identische Spawns
   const cs = tr.sim.creatures;
   const ctls = cs.map(c => ({

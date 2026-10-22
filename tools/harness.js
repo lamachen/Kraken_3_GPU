@@ -643,6 +643,59 @@ if (want('train')) {
   const a0 = runs[0][0].anchor, a1 = runs[0][runs[0].length - 1].anchor;
   check('train-grips', 'Anker-Rate steigt (Haften wird entdeckt)', a1 > a0,
     `${(a0 * 100).toFixed(0)} % → ${(a1 * 100).toFixed(0)} %`);
+
+  // ── CRN-Spawns: der Mechanismus hinter dem Lern-Durchbruch ──────────────
+  // Ohne CRN zog resetCreatures frische Zufalls-Spawns — sogar für die beiden
+  // Hälften desselben Spiegelpaars. Gemessen (tools/spawnnoise-probe.mjs,
+  // pop 64, 500 Schritte): identisches Genom liefert Score 21…367 allein aus
+  // der Spawn-Lotterie (Paardifferenz-sd 46.3 Punkte), während eine echte
+  // ES-Generation (σ=0.06) Paardifferenz-sd 45.6 hatte — der Gradient war
+  // reines Rauschen. Mit CRN (Paar teilt Spawn+Heading, Ring-Regel
+  // SPAWN_CLEAR ≤ Wandabstand ≤ ARM_REACH) ist der Noise-Floor exakt 0 und
+  // dasselbe σ-Signal misst 18.6 Punkte. Konsequenz in 130-Gen-Läufen
+  // (tools/trainrun.js, θ auf frischen Spawns/Karten): Ø 138.3 px mit CRN
+  // vs. Ø 106.1 px ohne (n=2 Seeds, Trend — die Mechanik ist gepinnt, der
+  // Lernvorteil liegt innerhalb der Seed-Streuung).
+  {
+    const { N_IN, N_W, SPAWN_CLEAR } = await import('../src/sim/train.js');
+    const { HIDDEN, OUT_DIM, randomGenome } = await import('../src/brain/net.js');
+    const { score } = await import('../src/sim/fitness.js');
+    const identRun = (crn) => {
+      const tr = createTrainer({ popSize: 8, stepsPerGen: 150, seed: 11, prey: 0, crnSpawns: crn });
+      const g0 = randomGenome(N_IN, HIDDEN, OUT_DIM, mulberry32(4242));
+      beginGeneration(tr);
+      for (let i = 0; i < 8; i++) tr.genomes.set(g0, i * N_W);
+      for (let s = 0; s < 150; s++) trainStep(tr);
+      const f = tr.sim.creatures.map(c => score(c, tr.opts));
+      let d = 0, lo = Infinity, hi = -Infinity;
+      for (let p = 0; p < 4; p++) d = Math.max(d, Math.abs(f[2 * p] - f[2 * p + 1]));
+      for (const v of f) { if (v < lo) lo = v; if (v > hi) hi = v; }
+      return { d, lo, hi };
+    };
+    const w = identRun(true), o = identRun(false);
+    check('crn-pair-noise', 'CRN: identisches Genom im Spiegelpaar → Fitnessdifferenz exakt 0',
+      w.d === 0 && o.d > 1,
+      `mit CRN maxΔ ${w.d} (Score-Spanne ${w.lo.toFixed(0)}…${w.hi.toFixed(0)}), ` +
+      `ohne CRN maxΔ ${o.d.toFixed(1)} (Spanne ${o.lo.toFixed(0)}…${o.hi.toFixed(0)}) — ohne CRN ist die Differenz pure Spawn-Lotterie`);
+
+    const tr2 = createTrainer({ popSize: 16, stepsPerGen: 10, seed: 12, prey: 0 });
+    const cache = tr2.sim.spawnCache || [];
+    let ringOk = cache.length === 16, pairOk = cache.length === 16, dMin = Infinity, dMax = 0;
+    for (let i = 0; i < cache.length; i++) {
+      const h = tr2.sim.map.sdf(cache[i].x, cache[i].y);
+      const d = h ? h.d : -1;
+      if (d < dMin) dMin = d; if (d > dMax) dMax = d;
+      if (!(d >= SPAWN_CLEAR && d <= ARM_REACH)) ringOk = false;
+      if (i & 1) {
+        const a = cache[i - 1];
+        if (cache[i].x !== a.x || cache[i].y !== a.y || cache[i].angle !== a.angle) pairOk = false;
+      }
+    }
+    check('crn-spawn-ring', 'CRN-Spawns liegen im Ring (frei, aber Greifbares in Reichweite) und paarweise identisch',
+      ringOk && pairOk,
+      `${cache.length} Spawns, Wandabstand ${dMin.toFixed(1)}…${dMax.toFixed(1)} px (Ring ${SPAWN_CLEAR}…${ARM_REACH.toFixed(1)}), Paare identisch: ${pairOk}. ` +
+      `Jenseits von ${ARM_REACH.toFixed(1)} px ist nichts greifbar (pathLen 2.9 px/150 Schr.), in der Wand explodiert der Respawn.`);
+  }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -958,7 +1011,8 @@ const { createTrainer } = await import('../src/sim/train.js');
     check('order-chaos', 'CPU-Listenordnung gedreht (f64) divergiert — ordnungs-chaotisch',
       r.maxD > 1,
       `maxΔ ${r.maxD.toFixed(2)} px, Flips ${r.mism}/7200, pathLen ${r.plA.toFixed(2)}→${r.plB.toFixed(2)} ` +
-      `(Referenz: 35.35 px, 236 Flips, +25.3 %). Betrifft die CPU: die löst Gauss-Seidel in ` +
+      `(Referenz vor CRN-Spawns: 35.35 px, 236 Flips, +25.3 %; mit CRN-Spawns 27.87 px, 26 Flips — ` +
+      `dieselbe Klasse, nur ein anderes Szenario). Betrifft die CPU: die löst Gauss-Seidel in ` +
       `Listenordnung über ALLE Farben gemischt. Die GPU dispatched farbweise aufsteigend — ` +
       `dieselbe Ordnung wie die CPU nach groupConstraintsByColor, also kein Unterschied.`);
   }
@@ -974,7 +1028,7 @@ const { createTrainer } = await import('../src/sim/train.js');
     check('f32-class', 'f32-Emulation (per-op, race-freie Kollision): NaN 0, maxΔ < 5 px, pathLen ±2 %',
       r.nan === 0 && r.maxD < 5 && Math.abs(pct(r)) < 2,
       `maxΔ ${r.maxD.toFixed(3)} px, pathLen ${r.plA.toFixed(2)}→${r.plB.toFixed(2)} (${pct(r).toFixed(2)} %), NaN ${r.nan} ` +
-      `(Referenz seed 7/pop 8: 0.78 px/+0.24 %; pop 32: 0.36 px/+0.01 %) — DAS ist die Erwartung für die GPU nach dem Race-Fix`);
+      `(Referenz seed 7/pop 8: 0.78 px/+0.24 %, pop 32: 0.36 px/+0.01 % vor CRN-Spawns; mit CRN 0.032 px/−0.01 %) — DAS ist die Erwartung für die GPU nach dem Race-Fix`);
 
     // d) Der Race selbst — reproduzierbare Ursache statt Vermutung. 'race'
     //    emuliert den Stand 529fdc7 (ein Thread pro Kollisionspunkt, letzter
