@@ -34,12 +34,23 @@ export function createTrainer(opts = {}) {
     // nicht messbar. crnSpawns:false stellt das alte Verhalten bitgenau
     // wieder her (für A/B-Messungen).
     crnSpawns: true,
+    // Warm start: baseGenome setzt es.theta exakt (Standard: θ₀ = 0, denn
+    // createES startet mit einem Null-Vektor und beginGeneration schreibt
+    // ALLE Populations-Genome aus θ₀ ± σ·ε neu — die Population allein zu
+    // seeden wäre wirkungslos). Damit kann der shipped Walker
+    // (genomes/walker-crn-s1.json) in der Konsole weiter-evolviert werden.
+    baseGenome: null,
     ...opts,
   };
   const pop = o.popSize % 2 === 0 ? o.popSize : o.popSize + 1;  // createES rundet sonst still auf
   o.popSize = pop;
   const sim = createSim({ ...o, creatures: pop, prey: o.prey });
   const es = createES(N_W, { popSize: pop, sigma: o.sigma, lr: o.lr });
+  if (o.baseGenome) {
+    const b = Float32Array.from(o.baseGenome);
+    if (b.length !== N_W) throw new Error(`baseGenome hat ${b.length} Gewichte, erwartet ${N_W}`);
+    es.theta.set(b);
+  }
 
   // Flache Blöcke — dieselbe Form, die der GPU-Buffer hat
   const genomes = new Float32Array(pop * N_W);
@@ -65,7 +76,7 @@ export function createTrainer(opts = {}) {
     gen: 0, stepInGen: 0, history: [],
   };
   if (o.crnSpawns) sim.spawnCache = crnSpawns(sim, pop, rnd, true);
-  seedPopulation(tr);
+  seedPopulation(tr, o.baseGenome);
   return tr;
 }
 
@@ -165,10 +176,16 @@ function resetCreatures(tr) {
   }
 }
 
-/** Ein Tier an neuer Position neu aufsetzen, ohne die Welt neu zu bauen. */
+/**
+ * Ein Tier an neuer Position neu aufsetzen, ohne die Welt neu zu bauen.
+ * Exportiert, weil auch der Viewer (index.html, θ-Modus) seine Tiere auf
+ * Ring-Spawns setzen muss: der evolvierte Walker ist auf dem Ring
+ * SPAWN_CLEAR ≤ Wandabstand ≤ ARM_REACH trainiert — jenseits der
+ * ARM_REACH-Spawns des Demo-Modus findet er nichts Greifbares und läuft nicht.
+ */
 import { ARM_REACH } from '../body/kraken.js';
 import { measureReach } from './fitness.js';
-function respawnCreature(sim, c, x, y, angle) {
+export function respawnCreature(sim, c, x, y, angle) {
   const w = sim.world;
   // Alle Körper des Tiers an die neue Pose setzen: Mantel + Arme neu verkettet.
   const arms = c.arms;

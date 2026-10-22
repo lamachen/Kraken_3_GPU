@@ -59,6 +59,10 @@ a{color:#0f8}
     <div><label>BEUTE (Duft/Lärm)</label><select id="selPrey">
       <option value="0" selected>aus</option><option value="4">4 Tiere</option>
     </select></div>
+    <div><label>START-GENOM (θ₀)</label><select id="selBase">
+      <option value="" selected>Zufall (θ₀ = 0)</option>
+      <option value="./genomes/walker-crn-s1.json">walker-crn-s1 (185 px)</option>
+    </select></div>
   </div>
   <div class="row">
     <button id="bStart">▶ Start</button>
@@ -101,7 +105,11 @@ import { createTrainer, endGeneration, trainStep, N_W,
 import { isAvailable, create as createGpu, destroy as destroyGpu, loadWgsl } from './src/gpu/gpuworld.js';
 import { createView } from './src/render/view.js';
 
-{ const b = document.getElementById('build'); if (b.textContent.includes('__')) b.textContent = 'dev'; }
+const BUILD = (() => {
+  const b = document.getElementById('build');
+  if (b.textContent.includes('__')) b.textContent = 'dev';
+  return b.textContent;
+})();
 
 const el = (id) => document.getElementById(id);
 const canvas = el('c');
@@ -162,8 +170,26 @@ function uiOpts() {
   };
 }
 
+const baseCache = {};
+async function loadBase(src) {
+  if (!src) return null;
+  if (!baseCache[src]) {
+    const res = await fetch(src + '?v=' + BUILD);   // Cache-Busting wie bei Modulen
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    baseCache[src] = Float32Array.from(await res.json());
+  }
+  return baseCache[src];
+}
+
 async function buildTrainer() {
   const o = uiOpts();
+  const baseSrc = el('selBase').value;
+  try {
+    o.baseGenome = await loadBase(baseSrc);
+  } catch (e) {
+    say('⚠ Start-Genom nicht ladbar (' + e.message + ') — Lauf startet aus Zufall.');
+    o.baseGenome = null;
+  }
   if (gpu) { destroyGpu(gpu); gpu = null; backend = null; }
   tr = createTrainer(o);
   if (device && wgsl) {
@@ -183,7 +209,8 @@ async function buildTrainer() {
   champGenome = null; el('bChamp').disabled = true;
   drawSpark();
   say(`Trainer bereit: pop ${o.popSize}, ${o.stepsPerGen} Schritte/Gen, Seed ${o.seed}, ` +
-      `Beute ${o.prey}, Backend ${backend ? 'GPU' : 'CPU'}.`);
+      `Beute ${o.prey}, Backend ${backend ? 'GPU' : 'CPU'}, ` +
+      `θ₀ = ${o.baseGenome ? 'walker-crn-s1 (Warm start — ES verfeinert den shipped Walker)' : '0 (Zufallsperturbation um den Nullpunkt)'}.`);
 }
 
 function applyFollow() {
@@ -354,12 +381,12 @@ el('bGen').onclick = async () => {
 el('bReset').onclick = async () => { setRunning(false); exitChamp(); mode = 'idle'; await buildTrainer(); };
 el('bChamp').onclick = () => { if (mode === 'champ') exitChamp(); else enterChamp(); };
 el('bFollow').onclick = () => { followOn = !followOn; applyFollow(); };
-for (const id of ['selPop', 'selSteps', 'inSeed', 'selPrey'])
+for (const id of ['selPop', 'selSteps', 'inSeed', 'selPrey', 'selBase'])
   el(id).onchange = async () => { setRunning(false); exitChamp(); mode = 'idle'; await buildTrainer(); };
 el('bCopy').onclick = async () => {
   const h = tr ? tr.history : [];
   let sum = `Kraken-Training · Build ${el('build').textContent} · Backend ${el('backend').textContent}\n`;
-  sum += `Parameter: ${JSON.stringify(uiOpts())}\n`;
+  sum += `Parameter: ${JSON.stringify({ ...uiOpts(), baseGenome: el('selBase').value || 'zufall' })}\n`;
   if (h.length) {
     sum += 'gen\tbest\tmean\tsigma\tdisp\tstrides\tanchor\tspin\n';
     for (const r of h) sum += [r.gen, r.best.toFixed(2), r.mean.toFixed(2), r.sigma.toFixed(4),

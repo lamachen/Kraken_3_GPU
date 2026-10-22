@@ -786,6 +786,106 @@ if (want('fitness')) {
     `Score ${scoreRatio.toFixed(2)} vs Distanz ${dispRatio.toFixed(2)} (vorher 0.71 vs 0.34 — der kleine Gang war fast so viel wert wie der große)`);
 }
 
+// ══════════════════════════════════════════════════════════════
+section('CHECK N5 — DER SHIPPED WALKER: θ läuft im Viewer exakt wie im Trainer');
+if (want('walker')) {
+  // Seit c4dcecc gibt es ein evolviertes Genom, das lokomotions-mäßig alle
+  // Skript-Gänge schlägt (Ø 138.3 px mit CRN vs. bester Skript-Gang 57.4 px,
+  // 130-Gen-Läufe). Es liegt als JSON im Repo und wird vom Viewer (index.html,
+  // θ-Modus) und von der Training-Konsole (Warm start) geladen. Diese Sektion
+  // pinnt drei Regressionen:
+  //   1. das Genom läuft weiterhin (jeder Physik-/Fitness-/Eingangs-Refactor,
+  //      der es still invalidiert, fällt hier auf — Eingangs-Layout-Änderungen
+  //      sind laut README ohnehin verboten, weil sie Genome verwerfen),
+  //   2. der Viewer-Pfad (src/render/theta.js) ist BIT-IDENTISCH zum Trainer-
+  //      Pfad (trainStep) — derselbe Anspruch wie gputrain-passthrough, nur
+  //      für die Einzeltier-Verdrahtung des Viewers,
+  //   3. der Warm start der Konsole setzt es.theta exakt (createES startet
+  //      bei θ₀ = 0; ein baseGenome, das nur die Population seedet, wäre
+  //      wirkungslos, weil beginGeneration alle Genome aus θ₀ ± σ·ε neu schreibt).
+  const { createTrainer, beginGeneration, trainStep, rerollSpawns, respawnCreature, N_IN, N_W } = await import('../src/sim/train.js');
+  const { createThetaControl } = await import('../src/render/theta.js');
+  const { randomGenome } = await import('../src/brain/net.js');
+
+  // ── 1) Shipped Walker: Datei valide, deployed, und er LÄUFT ──
+  const wf = readFileSync(join(ROOT, '.github/workflows/deploy-pages.yml'), 'utf8');
+  const deployOk = /cp -r [^\n]*genomes/.test(wf) && wf.includes('test -f site/genomes/walker-crn-s1.json');
+  const thetaFile = join(ROOT, 'genomes/walker-crn-s1.json');
+  const theta = Float32Array.from(JSON.parse(readFileSync(thetaFile, 'utf8')));
+  {
+    const tr = createTrainer({ popSize: 16, stepsPerGen: 500, seed: 777, prey: 0 });
+    rerollSpawns(tr, false);                     // 16 frische Ring-Spawns, Karte seed 777
+    beginGeneration(tr);
+    for (let i = 0; i < 16; i++) tr.genomes.set(theta, i * N_W);
+    for (let s = 0; s < 500; s++) trainStep(tr);
+    const C = tr.sim.creatures;
+    const avg = (f) => C.reduce((a, c) => a + f(c), 0) / C.length;
+    const disp = avg(c => c.maxDisplacement);
+    const anchor = avg(c => c.steps ? c.anchoredSteps / c.steps : 0);
+    check('walker-shipped', 'walker-crn-s1.json läuft (Ø ≥ 140 px/500 Schr.) und wird deployed',
+      theta.length === N_W && deployOk && disp >= 140,
+      `${theta.length} Gewichte; Ø Disp ${disp.toFixed(1)} px, Ende ${avg(c => Math.hypot(c.x - c.spawn.x, c.y - c.spawn.y)).toFixed(1)} px, ` +
+      `Anker ${(anchor * 100).toFixed(0)} %, Griffe ${avg(c => c.strides).toFixed(0)} (pop 16, Karte seed 777); ` +
+      `Deploy: ${deployOk ? 'Workflow kopiert genomes/ + test -f ✓' : 'genomes/ fehlt im Workflow'}`);
+  }
+
+  // ── 2) Viewer-θ == Trainer-Pfad, bit-identisch ──
+  // Beide Seiten: Karte seed 5, 2 Tiere, prey 0, dieselben Ring-Spawns,
+  // dasselbe Zufallsgenom in beiden Slots. trainStep (flache Blöcke) gegen
+  // theta.js (WeakMap pro Tier). stepSim verbraucht ohne Entities kein RNG,
+  // also darf nach 300 Schritten KEIN Bit Unterschied stehen — jede Abweichung
+  // ist eine Verdrahtungslüge (Offsets, Reihenfolge, rekurrenter Zustand).
+  {
+    const g = randomGenome(N_IN, 24, 20, mulberry32(999));
+    const SEED = 5, STEPS = 300;
+    const trA = createTrainer({ popSize: 2, stepsPerGen: 1e9, seed: SEED, prey: 0 });
+    beginGeneration(trA);
+    trA.genomes.set(g, 0); trA.genomes.set(g, N_W);
+    const simB = createSim({ seed: SEED, creatures: 2, prey: 0 });
+    for (let i = 0; i < 2; i++) {
+      const sp = trA.sim.spawnCache[i];
+      respawnCreature(simB, simB.creatures[i], sp.x, sp.y, sp.angle);
+    }
+    const ctl = createThetaControl(g);
+    for (let s = 0; s < STEPS; s++) {
+      trainStep(trA);
+      for (const c of simB.creatures) applyControl(c, ctl.control(c, simB));
+      stepSim(simB);
+    }
+    let maxD = 0, moved = 0;
+    for (let i = 0; i < 2; i++) {
+      const a = trA.sim.creatures[i], b = simB.creatures[i];
+      maxD = Math.max(maxD,
+        Math.abs(trA.sim.world.px[a.mantle] - simB.world.px[b.mantle]),
+        Math.abs(trA.sim.world.py[a.mantle] - simB.world.py[b.mantle]));
+      moved = Math.max(moved, a.maxDisplacement);
+    }
+    check('theta-viewer-parity', 'Viewer-θ (theta.js) bit-identisch zu trainStep',
+      maxD === 0 && moved > 1,
+      `maxΔ Mantel ${maxD} px nach ${STEPS} Schritten (beide Tiere bewegt: maxDisp ${moved.toFixed(1)} px)`);
+  }
+
+  // ── 3) Warm start: baseGenome → es.theta exakt ──
+  {
+    const base = randomGenome(N_IN, 24, 20, mulberry32(1234));
+    const trW = createTrainer({ popSize: 4, stepsPerGen: 10, seed: 3, baseGenome: base });
+    let thetaOk = true;
+    for (let k = 0; k < N_W; k++) if (trW.es.theta[k] !== base[k]) thetaOk = false;
+    const trZ = createTrainer({ popSize: 4, stepsPerGen: 10, seed: 3 });
+    let zeroOk = true;
+    for (let k = 0; k < N_W; k++) if (trZ.es.theta[k] !== 0) zeroOk = false;
+    beginGeneration(trW);
+    let perturbed = false;
+    for (let k = 0; k < N_W; k++) if (trW.genomes[k] !== trW.es.theta[k]) perturbed = true;
+    let threw = false;
+    try { createTrainer({ popSize: 4, seed: 3, baseGenome: new Float32Array(10) }); } catch { threw = true; }
+    check('warm-start-theta', 'baseGenome setzt es.theta exakt (Standard θ₀ = 0), Gen 1 = θ₀ ± σ·ε, falsche Länge wirft',
+      thetaOk && zeroOk && perturbed && threw,
+      `θ₀ == base: ${thetaOk}; ohne base θ₀ == 0: ${zeroOk}; Perturbation sichtbar: ${perturbed}; ` +
+      `Längenprüfung wirft: ${threw}`);
+  }
+}
+
 section('CHECK G8 — HYBRID-TRAINER: Spiegel-Feldmapping + Passthrough-Identität (M3c)');
 if (want('gputrain')) {
   const { mirrorInto, packControls, GPU_STRIDES } = await import('../src/gpu/gpuworld.js');

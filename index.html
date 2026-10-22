@@ -28,8 +28,10 @@
 <canvas id="c"></canvas>
 <div id="hud">
   <span><b>Kraken 3 GPU</b> <span class="dim">Build <b id="build">__BUILD_SHA__</b></span></span>
+  <span>Controller <b id="ctlName">Platzhalter</b></span>
   <span>Schritte <b id="steps">0</b></span>
   <span>Sim-Zeit <b id="time">0.0</b> s</span>
+  <span>Episode <b id="epi">–</b></span>
   <span>Tempo <b id="rate">1×</b></span>
   <span>Schritte/s <b id="sps">0</b></span>
   <span>Tiere <b id="count">1</b></span>
@@ -45,42 +47,79 @@
   <span>Tast <b id="st">0</b>/6</span>
 </div>
 <div id="ctl">
+  <button id="bTheta">θ Walker: lade…</button>
   <button id="b1" title="60 Schritte/s — der Gang in natürlicher Geschwindigkeit">1× Echtzeit</button>
   <button id="b4">4×</button>
   <button id="b16">16×</button>
   <button id="bT">Turbo</button>
   <button id="bTr" class="on">Spur</button>
   <button id="bF">Kamera folgt</button>
-  <button onclick="location.href='./train.html'">🧠 Training</button>
+  <button onclick="location.href='./train.html'">Training</button>
 </div>
-<div id="note">
-  Kein Gehirn, kein Framework, keine Physik-Engine. Der Gang ist ein Platzhalter-Controller
-  (<span class="dim">src/render/demo.js</span>), die Bewegung entsteht ausschließlich aus
-  Gelenk-Compliance und Saugnapf-Adhäsion — es wirkt keine Kraft auf den Mantel.
-  <br>Das Tier driftet netto ~4–6 px/s (<span class="dim">tools/demogait-probe.mjs</span>) —
-  <b>Netto</b> ist der Abstand zum Spawn-Kreuz, <b>Weg</b> die gesamte Pfadlänge.
-  Echtes Laufen entsteht erst durch Evolution: <a href="./train.html">Training-Konsole →</a>
-  <br>Abnahme: <a href="https://github.com/lamachen/Kraken_3_GPU/blob/main/tools/harness.js">tools/harness.js</a> · 73/73 Checks
-  <br>Violette Strahlen sind <b>eingetroffene</b> Echos — sie erscheinen erst nach der
-  Laufzeit 2·d/c, das Tier sieht also die Vergangenheit, nach Entfernung gestaffelt.
-  <br><a href="./gpu.html">GPU-Validierung gegen das CPU-Oracle →</a>
-  <br><span class="dim">Tasten: [S] Tempo · [T] Spur · [F] Kamera · [1…4] = 1/4/16/64 Tiere ·
-  [Leertaste] Pause · [R] neu würfeln</span>
-</div>
+<div id="note" ></div>
 <script type="module">
 import { createSim, stepSim, applyControl } from './src/sim/core.js';
 import { createView } from './src/render/view.js';
 import { demoControl } from './src/render/demo.js';
 import { createPacer } from './src/render/pace.js';
+import { createThetaControl } from './src/render/theta.js';
+import { crnSpawns, respawnCreature } from './src/sim/train.js';
+import { mulberry32 } from './src/world/map.js';
 
 // Build-Stempel: von tools/bust-cache.js beim Deploy ersetzt; lokal bleibt
 // das Platzhalter-Literal stehen und wird zu 'dev'. Ein von Hand gebackener
 // SHA neben gestempelten Modul-URLs hat schon einmal gelogen (M3b-Fall,
 // gepinnt durch den Check `build-stamps`).
-{
+const BUILD = (() => {
   const b = document.getElementById('build');
   if (b.textContent.includes('__')) b.textContent = 'dev';
-}
+  return b.textContent;
+})();
+
+// ── Controller-Modi ──────────────────────────────────────────────────
+// 'demo'  = Platzhalter-Gang aus src/render/demo.js (Milestone 1, kein Netz).
+// 'theta' = das EVOLVIERTE Genom genomes/walker-crn-s1.json, gefahren über
+//           denselben Verdrahtungspfad wie trainStep() (src/render/theta.js,
+//           Bit-Identität gepinnt durch den Check theta-viewer-parity).
+//           Trainiert mit Natural ES + CRN-Spawns (130 Generationen ×
+//           64 Tiere × 500 Schritte); gemessen Ø 172.8 px netto pro Episode
+//           auf einer beim Training nie gesehenen Karte (tools/theta-eval.mjs,
+//           seed 777, 32 frische Ring-Spawns) — der beste Skript-Gang schafft
+//           dort ~57 px (tools/demogait-probe.mjs).
+const EPISODE = 500;             // Schritte pro Episode = Trainings-Budget (8.3 s Sim-Zeit)
+const GENOME_URL = './genomes/walker-crn-s1.json';
+let mode = 'demo';
+let thetaCtl = null;
+let episode = 0, epiN = 1, ringRnd = null;
+
+const NOTE_DEMO = `
+  Kein Gehirn, kein Framework, keine Physik-Engine. Der Gang ist ein Platzhalter-Controller
+  (<span class="dim">src/render/demo.js</span>), die Bewegung entsteht ausschließlich aus
+  Gelenk-Compliance und Saugnapf-Adhäsion — es wirkt keine Kraft auf den Mantel.
+  <br>Das Tier driftet netto ~4–6 px/s (<span class="dim">tools/demogait-probe.mjs</span>) —
+  <b>Netto</b> ist der Abstand zum Spawn-Kreuz, <b>Weg</b> die gesamte Pfadlänge.
+  Echtes Laufen kommt vom evolvierten Netz: <b>[E]</b> schaltet den θ-Walker.
+  <br>Violette Strahlen sind <b>eingetroffene</b> Echos — sie erscheinen erst nach der
+  Laufzeit 2·d/c, das Tier sieht also die Vergangenheit, nach Entfernung gestaffelt.`;
+const NOTE_THETA = `
+  <b>θ-Walker — Lokomotion aus Evolution, nicht programmiert.</b> Das Netz
+  (105 Eingänge → 24 → 24 → 20, 3644 Gewichte, <span class="dim">genomes/walker-crn-s1.json</span>)
+  entschied 130 Generationen lang gegen 63 Konkurrenten pro Generation
+  (Natural ES, CRN-Spawns, Seed 1). Der Viewer fährt <b>denselben Code-Pfad wie das
+  Training</b> (<span class="dim">src/render/theta.js</span>, bit-identisch gepinnt).
+  <br>Gemessen: Ø <b>203 px netto</b> pro 500-Schritte-Episode auf dieser Kartenfamilie
+  (Seed 7, 6 Episoden, Bereich 108–300 px ≈ 24 px/s — 4× die Platzhalter-Drift);
+  auf einer beim Training nie gesehenen Karte Ø 172.8 px
+  (<span class="dim">tools/theta-eval.mjs</span>, seed 777, 32 Ring-Spawns), Anker-Zeit 77 %.
+  Eine Episode dauert 8.3 s Sim-Zeit; danach wird auf einen frischen Ring-Spawn
+  umgesetzt (Zähler <b>Episode</b> im HUD, <b>Netto</b> zählt pro Episode).
+  Trainiert ohne Beute — Chem/Gehör bleiben 0, das Echolot feuert das Netz selbst.
+  <br><b>[E]</b> zurück zum Platzhalter-Gang · Weiterlernen: <a href="./train.html">Training-Konsole</a> (Warm start ab diesem θ).`;
+const NOTE_COMMON = `
+  <br>Abnahme: <a href="https://github.com/lamachen/Kraken_3_GPU/blob/main/tools/harness.js">tools/harness.js</a> · 76/76 Checks
+  · <a href="./gpu.html">GPU-Validierung gegen das CPU-Oracle</a>
+  <br><span class="dim">Tasten: [E] Controller · [S] Tempo · [T] Spur · [F] Kamera · [1…4] = 1/4/16/64 Tiere ·
+  [Leertaste] Pause · [R] neu würfeln</span>`;
 
 let count = 1, seed = 7;
 let sim = createSim({ seed, creatures: count, prey: 4 });
@@ -94,9 +133,25 @@ const speedLabels = { 1: '1×', 4: '4×', 16: '16×', Infinity: 'Turbo' };
 const el = (id) => document.getElementById(id);
 el('count').textContent = count;
 
+/** Tiere auf Ring-Spawns setzen: frei, aber mit Greifbarem in ARM_REACH.
+ *  fresh=true (Rebuild/neu würfeln) startet die Episoden-Nummer bei 1. */
+function placeOnRing(fresh) {
+  sim.spawnCache = crnSpawns(sim, count, ringRnd, false);
+  for (let i = 0; i < count; i++) {
+    const sp = sim.spawnCache[i];
+    respawnCreature(sim, sim.creatures[i], sp.x, sp.y, sp.angle);
+  }
+  episode = 0;
+  epiN = fresh ? 1 : epiN + 1;
+}
+
 function rebuild(n, s) {
   count = n; if (s !== undefined) seed = s;
-  sim = createSim({ seed, creatures: count, prey: 4 });
+  // θ-Modus fährt die Trainingskonfiguration: keine Beute (so trainiert),
+  // Ring-Spawns (jenseits von ARM_REACH findet der Walker keinen Halt).
+  sim = createSim({ seed, creatures: count, prey: mode === 'theta' ? 0 : 4 });
+  ringRnd = mulberry32((seed ^ 0x5bf03635) >>> 0);
+  if (mode === 'theta') placeOnRing(true);
   view = createView(document.getElementById('c'), sim);
   view.setTrail(follow.trail);
   view.setFollow(follow.on ? 0 : null, 1.9);
@@ -104,10 +159,47 @@ function rebuild(n, s) {
 }
 const follow = { on: false, trail: true };
 
-function oneStep() {
-  for (const c of sim.creatures) applyControl(c, demoControl(c, sim.stepCount));
-  stepSim(sim);
+function setMode(m) {
+  if (m === 'theta' && !thetaCtl) return;
+  mode = m;
+  rebuild(count);
+  el('ctlName').textContent = m === 'theta' ? 'θ walker-crn-s1 (evolv.)' : 'Platzhalter (demo.js)';
+  el('bTheta').classList.toggle('on', m === 'theta');
+  el('note').innerHTML = (m === 'theta' ? NOTE_THETA : NOTE_DEMO) + NOTE_COMMON;
 }
+el('bTheta').onclick = () => setMode(mode === 'theta' ? 'demo' : 'theta');
+
+function oneStep() {
+  if (mode === 'theta') {
+    for (const c of sim.creatures) applyControl(c, thetaCtl.control(c, sim));
+    stepSim(sim);
+    episode++;
+    if (episode >= EPISODE) placeOnRing(false);   // neue Episode, frische Ring-Spawns
+  } else {
+    for (const c of sim.creatures) applyControl(c, demoControl(c, sim.stepCount));
+    stepSim(sim);
+  }
+}
+
+// ── θ-Genom laden und den Viewer damit starten ───────────────────────
+// ?v=<build>: dieselbe Cache-Busting-Disziplin wie bei den Modul-URLs —
+// ein altes Genom zu neuem Code hat dieselbe Fehlerklasse wie ein altes
+// gpuworld.js zu neuem gpu.html (bust-cache.js-Kommentar).
+(async () => {
+  try {
+    const res = await fetch(`${GENOME_URL}?v=${BUILD}`);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    thetaCtl = createThetaControl(await res.json());
+    el('bTheta').textContent = 'θ Walker: AN';
+    setMode('theta');
+  } catch (e) {
+    el('bTheta').textContent = 'θ Walker: nicht ladbar';
+    el('bTheta').disabled = true;
+    el('note').innerHTML = NOTE_DEMO + NOTE_COMMON +
+      `<br><span class="dim">θ-Genom nicht ladbar (${e.message}) — Platzhalter-Gang aktiv.</span>`;
+  }
+})();
+setMode('demo');   // Startzustand, bis das Genom da ist
 
 let paused = false;
 let last = performance.now();
@@ -141,6 +233,7 @@ function loop() {
 
   el('steps').textContent = sim.stepCount;
   el('time').textContent = sim.time.toFixed(1);
+  el('epi').textContent = mode === 'theta' ? epiN : '–';
   el('mv').textContent = sim.world.stats.maxSpeed.toFixed(0);
   const c0 = sim.creatures[0];
   let anch = 0;
@@ -184,6 +277,7 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'Digit2') rebuild(4);
   if (e.code === 'Digit3') rebuild(16);
   if (e.code === 'Digit4') rebuild(64);
+  if (e.code === 'KeyE') el('bTheta').click();
   if (e.code === 'KeyS') {
     const i = SPEEDS.indexOf(pacer.getSpeed());
     setSpeed(SPEEDS[(i + 1) % SPEEDS.length]);

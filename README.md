@@ -63,7 +63,7 @@ src/gpu/gpuworld.js    Buffer/Bind-Groups, upload/packControls, step, download/m
 src/sim/gputrain.js    Hybrid-Trainer: Physik GPU, Sinne/Netz/ES CPU, Zustandsspiegel.
 src/render/            EINZIGE DOM-abhängige Schicht (view.js), Platzhalter-Gang (demo.js),
                        Viewer-Takt (pace.js — DOM-frei, Checks pace-*).
-tools/harness.js       73 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
+tools/harness.js       76 Abnahme-Checks. Auch das Oracle für die WGSL-Portierung.
 tools/profile-step.js  Zerlegt den Tier-Schritt in Phasen (µs) — Architektur-Entscheide.
 tools/mocktrain.js     Hybrid-Trainer headless ohne Device (Passthrough/f32-Mock).
 tools/f32solver.mjs    f32-Solver-Emulation (WGSL-Semantik per-op, 4 Kollisions-Modi).
@@ -136,7 +136,7 @@ voll gestellt   (900 N Grenze)  → hält unter demselben Zug
 ## Abnahme: `node tools/harness.js`
 
 ```
-73/73 Checks bestanden
+76/76 Checks bestanden
   passiv        exakt in Ruhe            Pfad 0.00e+0 px        (v2: 964 px)
   slack-fixpoint Störung < slack         Δ = 0.00e+0 px, v = 0  (f32-Boden: GPU driftete 1.28 px)
   slack-corrects 25× slack korrigiert    0.050 px → 1.95e-3 px
@@ -740,8 +740,44 @@ legacy 36.1/35.6 px, sync T=32 57.4/46.7 px, wave T=32 46.4/39.8 px —
 Reihenfolge unverändert. **Echtes Laufen ist nicht mehr Aufgabe der
 Evolution, sondern ihr Ergebnis**: 130-Generationen-Läufe erreichen θ-Werte
 von 87.6…185.1 px auf derselben Verteilung — 1.5–3.2× der beste Skript-Gang
-(Milestone 3, Abschnitt „CRN-Fix"). Das Sieger-Genom liegt als
-`genomes/walker-crn-s1.json` im Repo; ein Viewer-Loader dafür fehlt noch.
+(Milestone 3, Abschnitt „CRN-Fix").
+
+**θ-Modus: das Sieger-Genom läuft im Viewer.** `genomes/walker-crn-s1.json`
+wird beim Seitenstart geladen und fährt den Viewer automatisch als
+Standard-Controller (Taste/Button **E** schaltet zurück auf den
+Platzhalter-Gang). Der Loader ist kein Sonderzweig: `src/render/theta.js`
+fährt pro Tier exakt die Verdrahtung von `trainStep()` (Proprio → Sinne →
+rekurrente Ausgaben → `forwardInto` → `decode`), und der Check
+`theta-viewer-parity` pinnt die Bit-Identität beider Pfade (maxΔ Mantel
+0 px nach 300 Schritten — CPU gegen CPU, dieselben f64-Pfade).
+
+Präsentation folgt der Trainings-Bedingung, sonst lügt der Viewer:
+
+- **Ring-Spawns statt Demo-Spawns.** θ ist auf dem Ring
+  `SPAWN_CLEAR ≤ Wandabstand ≤ ARM_REACH` trainiert; die Demo-Spawns
+  (`findSpawn(ARM_REACH + 20)`) liegen jenseits jeder Greifbarkeit — der
+  Walker würde dort verhungern wie jedes Zufallsgenom (pathLen 2.9 px/150 Schr.).
+  `respawnCreature` ist dafür jetzt exportiert.
+- **Episoden wie im Training.** Alle 500 Schritte (8.3 s Sim-Zeit) wird auf
+  frische Ring-Spawns umgesetzt; das HUD zeigt die Episoden-Nummer, **Netto**
+  zählt pro Episode (Spawn-Kreuz wandert mit).
+- **Keine Beute.** Trainiert mit `prey: 0` — Chem/Gehör bleiben 0, das
+  Echolot feuert das Netz selbst (Aktion, kein Dauerzustand).
+
+Gemessen im exakten Viewer-Flow (headless, 6 Episoden à 500 Schritte):
+
+| Karten-Seed | Episoden-Netto px | Ø px/Episode | ≈ px/s (1×) |
+|---|---|---|---|
+| **7 (Viewer-Default)** | 108–300 | **203.4** | ~24 |
+| 11 | 30–286 | 166.7 | ~20 |
+| 42 | 36–238 | 140.4 | ~17 |
+
+Zum Vergleich: der Platzhalter-Gang driftet 4–6 px/s, der beste Skript-Gang
+erreicht ~57 px/Episode. Die Spawn-Streuung (30–300 px) ist ehrlich
+mitgemessen — sie kommt aus der Ring-Lotterie (Nischen vs. offene Wand),
+nicht aus dem Genom. Regression: Check `walker-shipped` (Genom valide,
+deployed, Ø ≥ 140 px auf gepinnter Konfiguration — gemessen 220.2 px,
+pop 16, seed 777) + `genomes/` im Pages-Artefakt mit `test -f`-Gate.
 
 **`train.html` — Training-Konsole.** Interaktiver Trainer auf denselben
 Modulen wie gpu.html G8 (`src/sim/train.js`, `src/sim/gputrain.js`): Physik
@@ -749,8 +785,15 @@ auf der GPU (ein geteiltes WebGPU-Device, automatischer CPU-Fallback mit
 Log-Meldung), Sinne/Netz/ES auf der CPU über den Zustandsspiegel.
 
 - **Regler:** Population 16–256, Schritte/Generation 450/900/1800, Seed,
-  Beute aus/4. Parameter-Änderung baut den Trainer neu (GPU-World wird
-  zerstört und neu angelegt — die Device-Leak-Lehre aus gpu.html).
+  Beute aus/4, **Start-Genom θ₀** (Zufall = 0 oder `walker-crn-s1` = Warm
+  start). Parameter-Änderung baut den Trainer neu (GPU-World wird zerstört
+  und neu angelegt — die Device-Leak-Lehre aus gpu.html).
+- **Warm start setzt `es.theta`, nicht die Population.** `beginGeneration`
+  schreibt ALLE Populations-Genome aus θ₀ ± σ·ε neu — ein baseGenome, das nur
+  die Start-Population seedet, wäre ab Generation 1 wirkungslos verflogen.
+  `createTrainer({ baseGenome })` setzt deshalb θ₀ exakt (gepinnt: Check
+  `warm-start-theta`, inkl. Längenprüfung). Die ES verfeinert dann den
+  shipped Walker statt bei Null anzufangen.
 - **Lauf:** Start/Pause (Leertaste), „1 Generation" (G) läuft bis zum
   Generationsende und pausiert, Reset. Fortschrittsbalken = Schritte der
   laufenden Generation.
@@ -770,7 +813,7 @@ Log-Meldung), Sinne/Netz/ES auf der CPU über den Zustandsspiegel.
 ## Lokal
 
 ```bash
-node tools/harness.js          # 73 Abnahme-Checks
+node tools/harness.js          # 76 Abnahme-Checks
 node tools/harness.js --only chaos          # G7-Fehlerklassen (absorbiert vs chaotisch)
 node tools/check-wgsl.js       # Shader/Binding-Konsistenz (Textvergleich, ohne GPU)
 npm i --no-save naga-wasm@30.2.0 && node tools/compile-wgsl.js   # echter WGSL-Compile
@@ -793,7 +836,8 @@ python3 -m http.server 8080    # oder: npx serve .   → http://localhost:8080
 ES-Module brauchen einen Server (CORS bei `file://`). Kein Build, keine
 Abhängigkeiten.
 
-Viewer (`index.html`): `S` = Tempo (1×/4×/16×/Turbo) · `T` = Spur · `F` = Kamera
-folgt · `1…4` = 1/4/16/64 Tiere · `Leertaste` = Pause · `R` = Karte neu würfeln.
+Viewer (`index.html`): `E` = Controller (θ Walker / Platzhalter) · `S` = Tempo
+(1×/4×/16×/Turbo) · `T` = Spur · `F` = Kamera folgt · `1…4` = 1/4/16/64 Tiere ·
+`Leertaste` = Pause · `R` = Karte neu würfeln.
 Training-Konsole (`train.html`): `Leertaste` = Start/Pause · `G` = eine
 Generation · `C` = Champion-Zeitlupe · `R` = Reset.
